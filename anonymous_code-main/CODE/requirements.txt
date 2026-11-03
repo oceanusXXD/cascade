@@ -1,4 +1,0 @@
-blingfire==0.1.8
-numpy==1.26.4
-openai==2.29.0
-scipy==1.12.0

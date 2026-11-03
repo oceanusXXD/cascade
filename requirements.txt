@@ -1,0 +1,7 @@
+numpy
+blingfire
+sentence-transformers
+transformers
+torch
+openai
+faiss-cpu
