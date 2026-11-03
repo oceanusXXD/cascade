@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .data import read_json, read_rows, write_json, write_rows
+from .data import read_rows, write_json, write_rows
 from .models import Embedder
 
 
@@ -64,12 +64,17 @@ def score_rows(rows, predictions, vectors, *, k=20, gamma=1, epsilon=0.001):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    embedding = commands.add_parser("embed", help="Prepare both views before starting the SLM server")
+    embedding = commands.add_parser("embed", help="Prepare both views before starting the SLM server",
+                                    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     embedding.add_argument("--input", required=True)
     embedding.add_argument("--evidence-output", required=True)
     embedding.add_argument("--document-output", required=True)
-    embedding.add_argument("--config", default="config.json")
-    scoring = commands.add_parser("score", help="Compute NS and freeze one stage's quantile grid")
+    embedding.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-4B", help="Model ID or local model directory")
+    embedding.add_argument("--device", default="cuda", help="Embedding device")
+    embedding.add_argument("--batch-size", type=int, default=16, help="Embedding batch size")
+    embedding.add_argument("--max-length", type=int, default=32768, help="Maximum embedding input length")
+    scoring = commands.add_parser("score", help="Compute NS and freeze one stage's quantile grid",
+                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     scoring.add_argument("--stage", choices=["stage1", "stage2"], required=True)
     scoring.add_argument("--input", required=True)
     scoring.add_argument("--predictions", required=True)
@@ -77,14 +82,18 @@ def main():
     scoring.add_argument("--output", required=True)
     scoring.add_argument("--grid", required=True)
     scoring.add_argument("--stage2-input", help="Required for stage1: writes the maximal Stage-2 pool")
-    scoring.add_argument("--config", default="config.json")
+    scoring.add_argument("--k", type=int, default=20, help="Number of nearest neighbors, excluding self")
+    scoring.add_argument("--gamma", type=float, default=1, help="Weight of the neighbor adjustment")
+    scoring.add_argument("--epsilon", type=float, default=0.001, help="Smoothing constant for confidence log odds")
+    scoring.add_argument("--grid-size", type=int, help="Quantile points; defaults to 32 for stage1, 64 for stage2")
     args = parser.parse_args()
-    config = read_json(args.config)
     rows = read_rows(args.input)
     if args.command == "embed":
         if not rows:
             raise ValueError("The population is empty")
-        embedder = Embedder(config["embedding"])
+        if min(args.batch_size, args.max_length) < 1:
+            parser.error("batch-size and max-length must be positive")
+        embedder = Embedder(args.embedding_model, device=args.device, batch_size=args.batch_size, max_length=args.max_length)
         for field, output in (("evidence", args.evidence_output), ("document", args.document_output)):
             texts = [f"Query: {row['query']}\nDocument:\n{row[field]}" for row in rows]
             vectors = embedder.encode(texts)
@@ -99,9 +108,11 @@ def main():
     with np.load(args.vectors) as saved:
         positions = {key: i for i, key in enumerate(saved["ids"].tolist())}
         vectors = saved["vectors"][[positions[row["id"]] for row in rows]]
-    scored = score_rows(rows, predictions, vectors, **config["ns"])
+    if args.k < 1 or args.gamma < 0 or args.epsilon <= 0:
+        parser.error("k and epsilon must be positive; gamma must be nonnegative")
+    scored = score_rows(rows, predictions, vectors, k=args.k, gamma=args.gamma, epsilon=args.epsilon)
     finite = [row["score"] for row in scored if row["score"] is not None]
-    points = config["grid"][args.stage]
+    points = args.grid_size if args.grid_size is not None else (32 if args.stage == "stage1" else 64)
     if points < 1:
         raise ValueError("Grid size must be positive")
     thresholds = np.unique(np.quantile(finite, np.linspace(0, 1, points))).tolist() if finite else [0.0]

@@ -20,7 +20,7 @@ def betting_log_wealth(errors, population_size, epsilon):
     residuals = (errors - mu) ** 2
     variance = (0.25 + np.r_[0.0, np.cumsum(residuals)[:-1]]) / t
     cap = np.divide(0.5, 1 - q, out=np.full_like(q, np.inf), where=q < 1)
-    bets = np.minimum(np.maximum((q - mu) / variance, 0), cap)
+    bets = np.minimum(np.maximum((q - mu) / (variance + (q - mu) ** 2), 0), cap)
     return float(np.log1p(bets * (q - errors)).sum())
 
 
@@ -43,12 +43,13 @@ def aligned_stages(population, stage1, stage2, grid1):
     return first, second, *arrays(first), *arrays(second)
 
 
-def model_cost(row, prices):
-    return (row["input_tokens"] * prices["input_price"] + row["output_tokens"] * prices["output_price"]) / 1e6
+def model_cost(row, input_price, output_price):
+    return (row["input_tokens"] * input_price + row["output_tokens"] * output_price) / 1e6
 
 
-def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, config):
-    tau, delta = config["tau"], config["delta"]
+def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, *, tau=0.9, delta=0.05,
+                 slm_input_price=0.2, slm_output_price=0.2, oracle_input_price=5, oracle_output_price=30,
+                 oracle_output_tokens=2):
     if not 0 < tau < 1 or not 0 < delta < 1:
         raise ValueError("tau and delta must be in (0, 1)")
     n_population = len(population)
@@ -66,12 +67,11 @@ def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, 
     sample = np.array([positions[row["id"]] for row in calibration])
     truth = np.array([labels[row["id"]] for row in calibration])
     wrong1, wrong2 = pred1[sample] != truth, pred2[sample] != truth
-    fixed_stage1_cost = sum(model_cost(row, config["slm"]) for row in stage1)
-    stage2_costs = np.array([model_cost(second[key], config["slm"]) if key in second else 0 for key in ids])
+    fixed_stage1_cost = sum(model_cost(row, slm_input_price, slm_output_price) for row in stage1)
+    stage2_costs = np.array([model_cost(second[key], slm_input_price, slm_output_price) if key in second else 0 for key in ids])
     # Oracle input lengths use the SLM tokenizer; output lengths are fixed before labels are read.
-    prices = config["oracle"]
-    oracle_costs = np.array([(first[key]["full_input_tokens"] * prices["input_price"] +
-                             prices["expected_output_tokens"] * prices["output_price"]) / 1e6 for key in ids])
+    oracle_costs = np.array([(first[key]["full_input_tokens"] * oracle_input_price +
+                             oracle_output_tokens * oracle_output_price) / 1e6 for key in ids])
     tracks = len(grid1)
     boundary = math.log(tracks / delta)
     candidates, certified = [], []
@@ -97,7 +97,10 @@ def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, 
               "calibration_size": len(calibration), "tracks": tracks, "level_per_track": delta / tracks,
               "grid_shape": [len(grid1), len(grid2)], "certified_count": len(certified),
               "stage2_search_cost": float(stage2_costs.sum()),
-              "calibration_cost": sum(model_cost(row, config["oracle"]) for row in oracle),
+              "calibration_cost": sum(model_cost(row, oracle_input_price, oracle_output_price) for row in oracle),
+              "cost_assumptions": {"slm_input_price": slm_input_price, "slm_output_price": slm_output_price,
+                                   "oracle_input_price": oracle_input_price, "oracle_output_price": oracle_output_price,
+                                   "oracle_output_tokens": oracle_output_tokens},
               "fallback": "all_oracle" if selected is None else None, "selected": selected}
     return policy, candidates
 
@@ -153,7 +156,8 @@ def merge(population, accepted, oracle):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    fit = commands.add_parser("fit", help="Certify tracks and choose their cheapest certified pair")
+    fit = commands.add_parser("fit", help="Certify tracks and choose their cheapest certified pair",
+                              formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     fit.add_argument("--population", required=True)
     fit.add_argument("--stage1", required=True)
     fit.add_argument("--stage2", required=True)
@@ -161,7 +165,13 @@ def main():
     fit.add_argument("--grid2", required=True)
     fit.add_argument("--calibration", required=True)
     fit.add_argument("--oracle-labels", required=True)
-    fit.add_argument("--config", default="config.json")
+    fit.add_argument("--tau", type=float, default=0.9, help="Target population agreement with the Oracle")
+    fit.add_argument("--delta", type=float, default=0.05, help="Failure probability across all lambda1 tracks")
+    fit.add_argument("--slm-input-price", type=float, default=0.2, help="SLM price per million input tokens")
+    fit.add_argument("--slm-output-price", type=float, default=0.2, help="SLM price per million output tokens")
+    fit.add_argument("--oracle-input-price", type=float, default=5, help="Oracle price per million input tokens")
+    fit.add_argument("--oracle-output-price", type=float, default=30, help="Oracle price per million output tokens")
+    fit.add_argument("--oracle-output-tokens", type=float, default=2, help="Expected tokens per binary Oracle response, fixed before labeling")
     fit.add_argument("--output-dir", required=True)
     routing = commands.add_parser("route", help="Apply the policy and prepare residual Oracle inputs")
     routing.add_argument("--population", required=True)
@@ -179,10 +189,16 @@ def main():
     population = read_rows(args.population)
     root = Path(args.output_dir)
     if args.command == "fit":
+        if min(args.slm_input_price, args.slm_output_price, args.oracle_input_price,
+               args.oracle_output_price, args.oracle_output_tokens) < 0:
+            parser.error("prices and expected output tokens must be nonnegative")
         grid1, grid2 = read_json(args.grid1)["thresholds"], read_json(args.grid2)["thresholds"]
         policy, candidates = joint_search(population, read_rows(args.stage1), read_rows(args.stage2),
                                          read_rows(args.calibration), read_rows(args.oracle_labels),
-                                         grid1, grid2, read_json(args.config))
+                                         grid1, grid2, tau=args.tau, delta=args.delta,
+                                         slm_input_price=args.slm_input_price, slm_output_price=args.slm_output_price,
+                                         oracle_input_price=args.oracle_input_price, oracle_output_price=args.oracle_output_price,
+                                         oracle_output_tokens=args.oracle_output_tokens)
         write_json(root / "policy.json", policy)
         write_rows(root / "candidates.jsonl", candidates)
         print(f"Certified {policy['certified_count']} candidates; selected: {policy['selected']}")

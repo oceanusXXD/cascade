@@ -4,7 +4,7 @@ import argparse
 import math
 import re
 
-from .data import read_json, read_rows, write_rows
+from .data import read_rows, write_rows
 from .models import ChatModel
 
 
@@ -88,10 +88,10 @@ def parse_slm(choice, count, *, batched, temperature):
     return [label_score(choice, start, end, temperature) or invalid[i] for i, (start, end) in enumerate(spans)]
 
 
-def full_inference(row, model, *, tokenizer=None, label_ids=None, temperature=15, context_window=32768):
+def full_inference(row, model, *, tokenizer=None, label_ids=None, temperature=15, context_window=32768,
+                   max_tokens=16):
     """One full-document call. The same function serves the SLM and the Oracle."""
     messages = full_messages(row)
-    max_tokens = 16
     if tokenizer is not None and token_count(tokenizer, messages) + max_tokens > context_window:
         raise ValueError(f"{row['id']}: full document exceeds the configured SLM context window")
     response = model.complete(messages, max_tokens=max_tokens, label_token_ids=label_ids)
@@ -107,17 +107,16 @@ def full_inference(row, model, *, tokenizer=None, label_ids=None, temperature=15
             "output_tokens": response.usage.completion_tokens}
 
 
-def batch_inference(rows, model, tokenizer, config):
+def batch_inference(rows, model, tokenizer, *, batch_token_budget=8192, context_window=32768,
+                    score_temperature=15):
     label_ids = binary_token_ids(tokenizer)
-    budget = config["batch_token_budget"]
-    if config["score_temperature"] <= 0:
-        raise ValueError("score_temperature must be positive")
+    budget = batch_token_budget
 
     def run_batch(batch):
         messages = batch_messages(batch)
         output_budget = max(16, 8 * len(batch))
         response = model.complete(messages, max_tokens=output_budget, label_token_ids=label_ids)
-        results = parse_slm(response.choices[0], len(batch), batched=True, temperature=config["score_temperature"])
+        results = parse_slm(response.choices[0], len(batch), batched=True, temperature=score_temperature)
         for row, result in zip(batch, results):
             yield {"id": row["id"], **result,
                    "input_tokens": response.usage.prompt_tokens / len(batch),
@@ -128,13 +127,13 @@ def batch_inference(rows, model, tokenizer, config):
     for row in rows:
         candidate = batch + [row]
         length = token_count(tokenizer, batch_messages(candidate))
-        fits = length <= budget and length + max(16, 8 * len(candidate)) <= config["context_window"]
+        fits = length <= budget and length + max(16, 8 * len(candidate)) <= context_window
         if not fits and batch:
             yield from run_batch(batch)
             batch = []
         if not batch:
             length = token_count(tokenizer, batch_messages([row]))
-            if length > budget or length + 16 > config["context_window"]:
+            if length > budget or length + 16 > context_window:
                 yield {"id": row["id"], "prediction": None, "base_confidence": None,
                        "defer_reason": "evidence_exceeds_batch_budget", "input_tokens": 0, "output_tokens": 0,
                        "full_input_tokens": token_count(tokenizer, full_messages(row))}
@@ -145,33 +144,49 @@ def batch_inference(rows, model, tokenizer, config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("mode", choices=["stage1", "full"])
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--model", choices=["slm", "oracle"], default="slm")
-    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--model", required=True, help="Actual model name served by the chat endpoint")
+    parser.add_argument("--base-url", required=True, help="Chat API base URL, including /v1")
+    parser.add_argument("--oracle", action="store_true", help="Full-document Oracle mode: binary labels without SLM confidence")
+    parser.add_argument("--tokenizer", help="SLM tokenizer ID or local directory; defaults to --model")
+    parser.add_argument("--api-key-env", help="Environment variable holding the key; Oracle defaults to ORACLE_API_KEY")
+    parser.add_argument("--temperature", type=float, default=0, help="Generation temperature")
+    parser.add_argument("--seed", type=int, help="Generation seed, when supported by the endpoint")
+    parser.add_argument("--reasoning-effort", help="Provider reasoning option, e.g. none; use only when supported")
+    parser.add_argument("--disable-thinking", action="store_true", help="Send enable_thinking=false to a vLLM chat template")
+    parser.add_argument("--batch-token-budget", type=int, default=8192, help="Stage-1 input token budget per packed prompt")
+    parser.add_argument("--context-window", type=int, default=32768, help="SLM input + output context limit")
+    parser.add_argument("--score-temperature", type=float, default=15, help="SLM margin-to-confidence temperature")
+    parser.add_argument("--max-output-tokens", type=int, default=16, help="Full-document completion budget; Stage 1 reserves 8 tokens per item")
     args = parser.parse_args()
-    config = read_json(args.config)
+    if args.mode == "stage1" and args.oracle:
+        parser.error("--oracle is used with full inference")
+    if min(args.batch_token_budget, args.context_window, args.score_temperature, args.max_output_tokens) <= 0:
+        parser.error("token budgets and score-temperature must be positive")
     rows = read_rows(args.input)
     if not rows:
         write_rows(args.output, [])
         print(f"Empty input -> {args.output}")
         return
-    if args.mode == "stage1" and args.model != "slm":
-        parser.error("stage1 uses the SLM")
-    model = ChatModel(config[args.model])
+    api_key_env = args.api_key_env or ("ORACLE_API_KEY" if args.oracle else None)
+    model = ChatModel(args.model, args.base_url, api_key_env=api_key_env, temperature=args.temperature,
+                      seed=args.seed, reasoning_effort=args.reasoning_effort, disable_thinking=args.disable_thinking)
     tokenizer = None
-    if args.model == "slm":
+    if not args.oracle:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(config["slm"]["tokenizer"])
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
     if args.mode == "stage1":
-        results = batch_inference(rows, model, tokenizer, config)
+        results = batch_inference(rows, model, tokenizer, batch_token_budget=args.batch_token_budget,
+                                   context_window=args.context_window, score_temperature=args.score_temperature)
     else:
         ids = binary_token_ids(tokenizer) if tokenizer is not None else None
         results = (full_inference(row, model, tokenizer=tokenizer, label_ids=ids,
-                                 temperature=config["score_temperature"], context_window=config["context_window"])
+                                 temperature=args.score_temperature, context_window=args.context_window,
+                                 max_tokens=args.max_output_tokens)
                    for row in rows)
     write_rows(args.output, results)
     print(f"{args.mode}/{args.model}: {len(rows)} records -> {args.output}")

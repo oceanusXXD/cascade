@@ -8,7 +8,7 @@ from collections import Counter
 import numpy as np
 from blingfire import text_to_sentences
 
-from .data import read_json, read_rows, write_rows
+from .data import read_rows, write_rows
 from .models import Embedder
 
 
@@ -56,15 +56,23 @@ def retrieve(row, embedder, *, window_size=3, rrf_k=60, buffer=5):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-4B", help="Model ID or local model directory")
+    parser.add_argument("--device", default="cuda", help="Embedding device, e.g. cuda, cuda:1, or cpu")
+    parser.add_argument("--batch-size", type=int, default=16, help="Embedding batch size")
+    parser.add_argument("--max-length", type=int, default=32768, help="Maximum embedding input length")
+    parser.add_argument("--window-size", type=int, default=3, help="Sentences per window; stride is 1")
+    parser.add_argument("--rrf-k", type=int, default=60, help="RRF rank denominator constant")
+    parser.add_argument("--buffer", type=int, default=5, help="Extra windows after the largest RRF gap")
     args = parser.parse_args()
-    config = read_json(args.config)
-    embedder = Embedder(config["embedding"])
+    if min(args.batch_size, args.max_length, args.window_size, args.rrf_k) < 1 or args.buffer < 0:
+        parser.error("sizes and rrf-k must be positive; buffer must be nonnegative")
+    embedder = Embedder(args.embedding_model, device=args.device, batch_size=args.batch_size, max_length=args.max_length)
     rows = read_rows(args.input)
-    write_rows(args.output, (retrieve(row, embedder, **config["retrieval"]) for row in rows))
+    write_rows(args.output, (retrieve(row, embedder, window_size=args.window_size, rrf_k=args.rrf_k,
+                                     buffer=args.buffer) for row in rows))
     print(f"RRF: {len(rows)} records -> {args.output}")
 
 
