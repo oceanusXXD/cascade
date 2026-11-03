@@ -1,8 +1,8 @@
-# CascadeFilter
+# Anonymous Artifact
 
-Research implementation of **Pay Only What You Need: Certifiably Accurate, Cost-Optimal LLM Semantic Filtering via Adaptive Cascade Routing**.
+A three-stage semantic filtering pipeline with joint threshold certification.
 
-CascadeFilter evaluates a natural-language predicate on each document using three stages:
+The pipeline evaluates a natural-language predicate on each document using three stages:
 
 | Stage | Model input | Invocation |
 | --- | --- | --- |
@@ -24,20 +24,20 @@ records → RRF → rerank → calibration sampling → two embedding views
 
 ## 1. Install and prepare the input
 
-Use Linux or WSL2 for the vLLM server, Python 3.10+, and a CUDA-capable GPU with sufficient memory. The paper uses an A100 80 GB. Embedding and reranking run locally; the SLM runs behind a vLLM endpoint; the Oracle uses a chat-completions-compatible endpoint.
+Use Linux or WSL2 for the vLLM server, Python 3.10+, and a CUDA-capable GPU with sufficient memory. Embedding and reranking run locally; the SLM runs behind a vLLM endpoint; the Oracle uses a chat-completions-compatible endpoint.
 
-Clone the reproduction branch, which contains this workflow:
+Extract the supplied archive and enter its root directory:
 
 ```bash
-git clone --branch refactor/simple-reproduction https://github.com/oceanusXXD/cascade.git
-cd cascade
+unzip anonymous-artifact.zip
+cd anonymous-artifact
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-The local embedding and reranker commands use the CUDA-enabled PyTorch installation in this environment. Run all subsequent commands from the repository root. Each command creates its output directories as needed.
+The local embedding and reranker commands use the CUDA-enabled PyTorch installation in this environment. Run all subsequent commands from the artifact root. Each command creates its output directories as needed.
 
 The included data contains three example records. To follow the workflow with those records:
 
@@ -60,12 +60,12 @@ For your experiment, put the actual dataset at `data/records.jsonl`. Each UTF-8 
 | `document` | Yes | Complete, nonempty source text |
 | `label` | Optional | Benchmark ground truth, `yes` or `no`, used for final evaluation |
 
-Sequential IDs are sufficient. Give different IDs to the same document evaluated against different queries. The six paper datasets are supplied separately; the included records illustrate the schema and workflow. A tiny population may select full Oracle fallback.
+Sequential IDs are sufficient. Give different IDs to the same document evaluated against different queries. The benchmark datasets are supplied separately; the included records illustrate the schema and workflow. A tiny population may select full Oracle fallback.
 
 ## 2. Retrieve candidates: BM25 + embedding RRF
 
 ```bash
-python -m cascade.rrf \
+python rrf.py \
   --input data/records.jsonl \
   --output runs/rrf.jsonl \
   --embedding-model Qwen/Qwen3-Embedding-4B \
@@ -83,7 +83,7 @@ Output: `runs/rrf.jsonl`, with the original record, sentences, and candidate win
 ## 3. Rerank and select evidence
 
 ```bash
-python -m cascade.rerank \
+python rerank.py \
   --input runs/rrf.jsonl \
   --output runs/evidence.jsonl \
   --reranker-model Qwen/Qwen3-Reranker-0.6B \
@@ -99,7 +99,7 @@ Output: `runs/evidence.jsonl`, including `evidence`, `selected_sentence_indices`
 ## 4. Draw the calibration sample
 
 ```bash
-python -m cascade.split \
+python split.py \
   --input runs/evidence.jsonl \
   --output-dir data/split \
   --seed 42
@@ -119,7 +119,7 @@ The calibration sample belongs to the certified population. All Stage-1 inferenc
 ## 5. Prepare both NS embedding views
 
 ```bash
-python -m cascade.ns embed \
+python ns.py embed \
   --input data/split/population.jsonl \
   --evidence-output runs/evidence_vectors.npz \
   --document-output runs/document_vectors.npz \
@@ -134,7 +134,7 @@ Complete Steps 2–5 before starting the SLM server on the same GPU. Each local 
 
 ## 6. Start the SLM server in a second terminal
 
-Keep the first terminal in `.venv`. Open the second terminal at the cloned repository root and create a separate vLLM environment:
+Keep the first terminal in `.venv`. Open the second terminal at the extracted artifact root and create a separate vLLM environment:
 
 ```bash
 python -m venv .venv-vllm
@@ -156,7 +156,7 @@ The SLM endpoint must expose token log probabilities and vLLM's `logprob_token_i
 Back in the first terminal:
 
 ```bash
-python -m cascade.inference stage1 \
+python inference.py stage1 \
   --input data/split/population.jsonl \
   --output runs/stage1.jsonl \
   --model Qwen/Qwen3-4B-Instruct-2507 \
@@ -168,7 +168,7 @@ python -m cascade.inference stage1 \
   --context-window 32768 \
   --score-temperature 15
 
-python -m cascade.ns score \
+python ns.py score \
   --stage stage1 \
   --input data/split/population.jsonl \
   --predictions runs/stage1.jsonl \
@@ -195,7 +195,7 @@ Outputs:
 ## 8. Run Stage 2 and compute NS₂
 
 ```bash
-python -m cascade.inference full \
+python inference.py full \
   --input runs/stage2_input.jsonl \
   --output runs/stage2.jsonl \
   --model Qwen/Qwen3-4B-Instruct-2507 \
@@ -206,7 +206,7 @@ python -m cascade.inference full \
   --context-window 32768 \
   --score-temperature 15
 
-python -m cascade.ns score \
+python ns.py score \
   --stage stage2 \
   --input runs/stage2_input.jsonl \
   --predictions runs/stage2.jsonl \
@@ -233,7 +233,7 @@ export ORACLE_API_KEY="your-key"
 Replace `YOUR_ORACLE_MODEL` with your provider's actual model name in this command and the residual Oracle command in Step 12. For a different provider, replace the base URL in both commands too.
 
 ```bash
-python -m cascade.inference full \
+python inference.py full \
   --oracle \
   --input data/split/calibration.jsonl \
   --output runs/oracle_calibration.jsonl \
@@ -253,7 +253,7 @@ Output: `runs/oracle_calibration.jsonl`, with Oracle predictions and token usage
 ## 10. Select thresholds with WS&R
 
 ```bash
-python -m cascade.wsr fit \
+python wsr.py fit \
   --population data/split/population.jsonl \
   --stage1 runs/stage1_scores.jsonl \
   --stage2 runs/stage2_scores.jsonl \
@@ -283,7 +283,7 @@ Outputs:
 ## 11. Apply the selected thresholds
 
 ```bash
-python -m cascade.wsr route \
+python wsr.py route \
   --population data/split/population.jsonl \
   --stage1 runs/stage1_scores.jsonl \
   --stage2 runs/stage2_scores.jsonl \
@@ -307,7 +307,7 @@ Outputs: `runs/route/accepted.jsonl` and `runs/route/pending_oracle.jsonl`. A de
 Use the same Oracle model, endpoint, and decoding options as Step 9:
 
 ```bash
-python -m cascade.inference full \
+python inference.py full \
   --oracle \
   --input runs/route/pending_oracle.jsonl \
   --output runs/oracle_residual.jsonl \
@@ -317,7 +317,7 @@ python -m cascade.inference full \
   --temperature 0 \
   --max-output-tokens 16
 
-python -m cascade.wsr merge \
+python wsr.py merge \
   --population data/split/population.jsonl \
   --accepted runs/route/accepted.jsonl \
   --oracle runs/oracle_residual.jsonl \
@@ -345,19 +345,19 @@ Each entry point exposes its arguments through `--help`. The important controls 
 
 | Command | Arguments and defaults |
 | --- | --- |
-| `rrf` | `--embedding-model Qwen/Qwen3-Embedding-4B`, `--device cuda`, `--batch-size 16`, `--max-length 32768`, `--window-size 3`, `--rrf-k 60`, `--buffer 5` |
-| `rerank` | `--reranker-model Qwen/Qwen3-Reranker-0.6B`, `--device cuda`, `--batch-size 8`, `--max-length 8192`, `--max-chunks 5` |
-| `split` | `--seed 42`; optional `--size` overrides the population-dependent sample size |
-| `ns embed` | `--embedding-model`, `--device cuda`, `--batch-size 16`, `--max-length 32768` |
-| `ns score` | `--k 20`, `--gamma 1`, `--epsilon 0.001`; `--grid-size` defaults to 32/64 for Stage 1/2 |
-| `inference` | Required `--model` and `--base-url`; tokenizer defaults to model; `--temperature 0`, `--score-temperature 15`, `--batch-token-budget 8192`, `--context-window 32768`, `--max-output-tokens 16` |
-| `wsr fit` | `--tau 0.9`, `--delta 0.05`, four token-price arguments, `--oracle-output-tokens 2` |
+| `python rrf.py` | `--embedding-model Qwen/Qwen3-Embedding-4B`, `--device cuda`, `--batch-size 16`, `--max-length 32768`, `--window-size 3`, `--rrf-k 60`, `--buffer 5` |
+| `python rerank.py` | `--reranker-model Qwen/Qwen3-Reranker-0.6B`, `--device cuda`, `--batch-size 8`, `--max-length 8192`, `--max-chunks 5` |
+| `python split.py` | `--seed 42`; optional `--size` overrides the population-dependent sample size |
+| `python ns.py embed` | `--embedding-model`, `--device cuda`, `--batch-size 16`, `--max-length 32768` |
+| `python ns.py score` | `--k 20`, `--gamma 1`, `--epsilon 0.001`; `--grid-size` defaults to 32/64 for Stage 1/2 |
+| `python inference.py` | Required `--model` and `--base-url`; tokenizer defaults to model; `--temperature 0`, `--score-temperature 15`, `--batch-token-budget 8192`, `--context-window 32768`, `--max-output-tokens 16` |
+| `python wsr.py fit` | `--tau 0.9`, `--delta 0.05`, four token-price arguments, `--oracle-output-tokens 2` |
 
 Model and tokenizer arguments accept a Hugging Face ID or the appropriate local model path. For a local model served under a short name, use that served name in `--model` and its matching model path in `--tokenizer`. Use `--api-key-env SLM_API_KEY` for an authenticated SLM endpoint after setting that variable. Oracle mode defaults to `ORACLE_API_KEY` when `--api-key-env` is omitted.
 
 ## Method and accounting details
 
-- **Confidence:** this implementation uses `sigmoid(abs(log p(Y) - log p(N)) / T)`, confidence in the predicted label. The manuscript's §3.2.3 prints a signed margin; align that definition when matching the method formula by formula.
+- **Confidence:** this implementation uses `sigmoid(abs(log p(Y) - log p(N)) / T)`, confidence in the predicted label. Positive and negative predictions use the same confidence definition.
 - **NS:** similarity-weighted agreement shrinks toward 0.5 with `rho = W / (W + median(W))`; routing adds `gamma * (2 * shrunk_NS - 1)` to smoothed confidence log odds. Invalid neighbor predictions carry zero voting weight. FAISS performs exact cosine search in blocks; compute grows quadratically with pool size.
 - **Betting:** the residual target is `q_t = clip((N*epsilon - sum_previous_errors)/(N-t+1), 0, 1)`. The positive bet uses `(q_t - mu_hat)/(variance_hat + (q_t - mu_hat)^2)`, clipped to `[0, 0.5/(1-q_t)]`. Only previous errors enter its estimates. See [Waudby-Smith and Ramdas, Appendix B.3](https://par.nsf.gov/servlets/purl/10379214) for the underlying aGRAPA rule.
 - **Cost:** candidate selection uses measured SLM usage and estimates Oracle input lengths with the SLM tokenizer and output lengths with `--oracle-output-tokens`. Maximal Stage-2 search and calibration-labeling costs are reported separately. Retrieval/indexing compute and the final provider bill are outside this estimate.
@@ -366,21 +366,17 @@ Model and tokenizer arguments accept a Hugging Face ID or the appropriate local 
 ## File tree
 
 ```text
-cascade/
+anonymous-artifact/
 ├── README.md
 ├── requirements.txt
 ├── examples/
 │   └── records.jsonl
-└── cascade/
-    ├── __init__.py
-    ├── data.py          # Shared JSON/JSONL I/O
-    ├── models.py        # Small model clients with explicit arguments
-    ├── rrf.py           # BM25 + embedding fusion
-    ├── rerank.py        # Reranking and evidence merging
-    ├── split.py         # Calibration sampling
-    ├── inference.py     # Batch evidence / shared full-document inference
-    ├── ns.py            # Embeddings, NS, and quantile grids
-    └── wsr.py           # Certification, routing, and final assembly
+├── rrf.py
+├── rerank.py
+├── split.py
+├── inference.py
+├── ns.py
+└── wsr.py
 ```
 
-Generated inputs, vectors, and results live under `data/` and `runs/`.
+The six scripts are independent entry points. They exchange files through explicit CLI paths and import no other project script. Input/output and model helpers stay inside the scripts that use them. Stage 2 and the Oracle share one full-document function inside `inference.py`. Generated data and results live under `data/` and `runs/`.

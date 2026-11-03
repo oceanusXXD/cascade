@@ -1,15 +1,46 @@
-"""Three-sentence windows -> BM25 + embedding ranks -> largest gap + 5."""
+"""BM25 and embedding rank fusion."""
 
 import argparse
+import json
 import math
 import re
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 from blingfire import text_to_sentences
 
-from .data import read_rows, write_rows
-from .models import Embedder
+
+def read_rows(path):
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    ids = [row["id"] for row in rows]
+    if any(not isinstance(key, str) or not key for key in ids) or len(set(ids)) != len(ids):
+        raise ValueError(f"{path}: each record needs a unique, nonempty string id")
+    return rows
+
+
+def write_rows(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+class Embedder:
+    def __init__(self, model, *, device="cuda", batch_size=16, max_length=32768):
+        from sentence_transformers import SentenceTransformer
+
+        self.model = SentenceTransformer(model, device=device)
+        self.model.max_seq_length = max_length
+        self.batch_size = batch_size
+
+    def encode(self, texts, *, query=False):
+        prompt = "Instruct: Given a predicate, retrieve relevant evidence from the document\nQuery: " if query else ""
+        return np.asarray(self.model.encode(
+            texts, prompt=prompt, batch_size=self.batch_size,
+            normalize_embeddings=True, show_progress_bar=False,
+        ), dtype=np.float32)
 
 
 def bm25_scores(query, chunks):

@@ -1,11 +1,44 @@
-"""Rerank RRF candidates, keep largest-gap prefix (cap 5), merge sentences."""
+"""Rerank and merge evidence."""
 
 import argparse
+import json
+from pathlib import Path
 
 import numpy as np
 
-from .data import read_rows, write_rows
-from .models import Reranker
+
+def read_rows(path):
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    ids = [row["id"] for row in rows]
+    if any(not isinstance(key, str) or not key for key in ids) or len(set(ids)) != len(ids):
+        raise ValueError(f"{path}: each record needs a unique, nonempty string id")
+    return rows
+
+
+def write_rows(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+class Reranker:
+    def __init__(self, model, *, device="cuda", batch_size=8, max_length=8192):
+        from sentence_transformers import CrossEncoder
+
+        self.model = CrossEncoder(
+            model, device=device, max_length=max_length,
+        )
+        self.batch_size = batch_size
+
+    def score(self, query, chunks):
+        import torch
+
+        return self.model.predict(
+            [(query, chunk) for chunk in chunks], batch_size=self.batch_size,
+            activation_fn=torch.nn.Sigmoid(), show_progress_bar=False,
+        ).tolist()
 
 
 def select_evidence(row, reranker, *, max_chunks=5):

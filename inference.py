@@ -1,11 +1,60 @@
-"""Stage 1 packs evidence records; full inference is shared by Stage 2 and Oracle."""
+"""Batched evidence and full-document inference."""
 
 import argparse
+import json
 import math
+import os
 import re
+from pathlib import Path
 
-from .data import read_rows, write_rows
-from .models import ChatModel
+
+def read_rows(path):
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    ids = [row["id"] for row in rows]
+    if any(not isinstance(key, str) or not key for key in ids) or len(set(ids)) != len(ids):
+        raise ValueError(f"{path}: each record needs a unique, nonempty string id")
+    return rows
+
+
+def write_rows(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+class ChatModel:
+    def __init__(self, model, base_url, *, api_key_env=None, temperature=0, seed=None,
+                 reasoning_effort=None, disable_thinking=False):
+        from openai import OpenAI
+
+        self.model = model
+        self.temperature = temperature
+        self.seed = seed
+        self.reasoning_effort = reasoning_effort
+        self.disable_thinking = disable_thinking
+        key = os.environ.get(api_key_env, "") if api_key_env else ""
+        if api_key_env and not key:
+            raise ValueError(f"Set the {api_key_env} environment variable before calling this model")
+        self.client = OpenAI(base_url=base_url, api_key=key or "EMPTY", max_retries=0)
+
+    def complete(self, messages, *, max_tokens, label_token_ids=None):
+        options = {"temperature": self.temperature}
+        extra = {}
+        if self.seed is not None:
+            options["seed"] = self.seed
+        if self.reasoning_effort is not None:
+            options["reasoning_effort"] = self.reasoning_effort
+        if self.disable_thinking:
+            extra["chat_template_kwargs"] = {"enable_thinking": False}
+        if label_token_ids is not None:
+            options.update(logprobs=True, top_logprobs=0)
+            extra["logprob_token_ids"] = label_token_ids
+        return self.client.chat.completions.create(
+            model=self.model, messages=messages, max_completion_tokens=max_tokens,
+            extra_body=extra or None, **options,
+        )
 
 
 SYSTEM = (
@@ -44,7 +93,6 @@ def binary_token_ids(tokenizer):
 
 
 def label_score(choice, start, end, temperature):
-    """Read both label alternatives at the token covering this output label."""
     offset = 0
     for item in choice.logprobs.content:
         token_end = offset + len(item.token)
@@ -90,7 +138,6 @@ def parse_slm(choice, count, *, batched, temperature):
 
 def full_inference(row, model, *, tokenizer=None, label_ids=None, temperature=15, context_window=32768,
                    max_tokens=16):
-    """One full-document call. The same function serves the SLM and the Oracle."""
     messages = full_messages(row)
     if tokenizer is not None and token_count(tokenizer, messages) + max_tokens > context_window:
         raise ValueError(f"{row['id']}: full document exceeds the configured SLM context window")

@@ -1,17 +1,41 @@
-"""WS&R at epsilon, fixed-sequence within lambda1 tracks, Bonferroni across tracks."""
+"""Joint threshold certification and routing."""
 
 import argparse
+import json
 import math
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
-from .data import read_json, read_rows, write_json, write_rows
+
+def read_rows(path):
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    ids = [row["id"] for row in rows]
+    if any(not isinstance(key, str) or not key for key in ids) or len(set(ids)) != len(ids):
+        raise ValueError(f"{path}: each record needs a unique, nonempty string id")
+    return rows
+
+
+def write_rows(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def betting_log_wealth(errors, population_size, epsilon):
-    """Paper Eq. (9), with residual centering and predictable aGRAPA bets."""
     errors = np.asarray(errors, dtype=float)
     t = np.arange(1, len(errors) + 1, dtype=float)
     prefix = np.r_[0.0, np.cumsum(errors)[:-1]]
@@ -63,13 +87,11 @@ def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, 
         raise ValueError("Oracle labels must cover exactly the calibration sample")
     if any(label not in {"yes", "no"} for label in labels.values()):
         raise ValueError("Each calibration record needs a binary Oracle prediction")
-    # Retain the original random draw order, even if the label file was reordered.
     sample = np.array([positions[row["id"]] for row in calibration])
     truth = np.array([labels[row["id"]] for row in calibration])
     wrong1, wrong2 = pred1[sample] != truth, pred2[sample] != truth
     fixed_stage1_cost = sum(model_cost(row, slm_input_price, slm_output_price) for row in stage1)
     stage2_costs = np.array([model_cost(second[key], slm_input_price, slm_output_price) if key in second else 0 for key in ids])
-    # Oracle input lengths use the SLM tokenizer; output lengths are fixed before labels are read.
     oracle_costs = np.array([(first[key]["full_input_tokens"] * oracle_input_price +
                              oracle_output_tokens * oracle_output_price) / 1e6 for key in ids])
     tracks = len(grid1)
