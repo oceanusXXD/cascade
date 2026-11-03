@@ -1,32 +1,43 @@
 # Anonymous Artifact
 
-A three-stage semantic filtering pipeline with joint threshold certification.
+A CLI implementation of three-stage semantic filtering. Given a query and a document, it returns a binary prediction and the stage that produced it.
 
-The pipeline evaluates a natural-language predicate on each document using three stages:
-
-| Stage | Model input | Invocation |
+| Stage | Input to the model | How it runs |
 | --- | --- | --- |
-| 1 | Retrieved, reranked evidence | Multiple records in one SLM prompt |
-| 2 | Full document | One SLM call per record |
-| 3 | Full document | One Oracle call per residual record |
+| Stage 1 | Selected evidence from the document | Several records packed into one SLM prompt |
+| Stage 2 | The full document | One SLM call per record in the maximal Stage-2 pool |
+| Stage 3 | The full document | One Oracle call per unresolved record |
 
-Each SLM stage produces a prediction and a base score from its signed Y/N log-probability margin. Neighbor Support (NS) adjusts that score using nearby predictions. A single calibration sample then certifies the two acceptance thresholds jointly using WS&R, with **fixed-sequence scanning within each λ₁ track and Bonferroni across tracks**.
+SLM means the small language model. Oracle means the stronger model selected for calibration and fallback. Stage 2 and the Oracle use the same full-document inference function.
 
-All settings are command-line arguments. The commands below are the complete workflow, in execution order.
+Neighbor Support (NS) adjusts each SLM stage's score using nearby predictions. WS&R jointly selects the two acceptance thresholds from one calibration sample: fixed-sequence scanning within each Stage-1 threshold track, with Bonferroni across tracks.
 
-```text
-records → RRF → rerank → calibration sampling → two embedding views
-        → Stage 1 → NS₁ / Λ₁ / maximal Stage-2 pool
-        → Stage 2 → NS₂ / Λ₂
-        → Oracle labels for calibration → WS&R threshold search
-        → routing → Oracle on the residual → final predictions
-```
+The workflow produces `runs/final/predictions.jsonl` and `runs/final/summary.json`. The supplied data is a three-record example; use your own query–document population for an actual experiment.
 
-## 1. Install and prepare the input
+## Before running
 
-Use Linux or WSL2 for the vLLM server, Python 3.10+, and a CUDA-capable GPU with sufficient memory. Embedding and reranking run locally; the SLM runs behind a vLLM endpoint; the Oracle uses a chat-completions-compatible endpoint.
+Use Linux or WSL2, Python 3.10+, a CUDA-enabled PyTorch installation, and a GPU with enough memory for the selected models. The commands use Bash syntax.
 
-Extract the supplied archive and enter its root directory:
+All parameters are CLI arguments. Choose the models, score parameters, grids, calibration budget, accuracy target, and failure budget before requesting calibration Oracle labels. The examples use:
+
+| Setting | Value used below |
+| --- | --- |
+| Embedding model | `Qwen/Qwen3-Embedding-4B` |
+| Reranker | `Qwen/Qwen3-Reranker-0.6B` |
+| SLM and its tokenizer | `Qwen/Qwen3-4B-Instruct-2507` |
+| SLM endpoint | `http://localhost:8000/v1` |
+| Oracle | Replace `YOUR_ORACLE_MODEL` with your served model name |
+| Generation temperature | 0 |
+| Margin temperature | 15 |
+| NS neighbors / weight | 20 / 1 |
+| Stage-1 / Stage-2 grid points | Up to 32 / 64 |
+| Target agreement / failure probability | `tau=0.9` / `delta=0.05` |
+
+The Oracle commands use a public chat API base URL as an example. Replace it for your provider. Both chat endpoints must support `max_completion_tokens`; the SLM endpoint must additionally return paired label probabilities through vLLM's `logprob_token_ids` option.
+
+## 1. Install and prepare the data — Terminal A
+
+Extract the archive, then run:
 
 ```bash
 unzip anonymous-artifact.zip
@@ -35,34 +46,37 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
-```
-
-The local embedding and reranker commands use the CUDA-enabled PyTorch installation in this environment. Run all subsequent commands from the artifact root. Each command creates its output directories as needed.
-
-The included data contains three example records. To follow the workflow with those records:
-
-```bash
 mkdir -p data
 cp examples/records.jsonl data/records.jsonl
 ```
 
-For your experiment, put the actual dataset at `data/records.jsonl`. Each UTF-8 JSONL line represents one query–document pair:
+If the files are already extracted, begin inside the directory containing `rrf.py` and `requirements.txt`. Run every command below from that directory.
+
+Keep Terminal A in `.venv`. It runs the six scripts. Terminal B, opened later, runs only the SLM server in a separate environment.
+
+### Input format
+
+`data/records.jsonl` is a UTF-8 file with one JSON object per line:
 
 ```json
-{"id":"q1-d1","query":"Does this review complain about the wait time?","document":"We waited an hour before being seated. The food was good.","label":"yes"}
-{"id":"q1-d2","query":"Does this review complain about the wait time?","document":"The staff seated us immediately. Dinner was excellent.","label":"no"}
+{"id":"review-1","query":"Does this review complain about the wait time?","document":"We booked a table for seven. We waited an hour before being seated. The food was good.","label":"yes"}
+{"id":"review-2","query":"Does this review complain about the wait time?","document":"The staff seated us immediately. Dinner was excellent. We will come back.","label":"no"}
 ```
 
-| Field | Required | Meaning |
-| --- | --- | --- |
-| `id` | Yes | Unique, nonempty string for the query–document pair |
-| `query` | Yes | Complete predicate, with any claim, function name, or specification filled in |
-| `document` | Yes | Complete, nonempty source text |
-| `label` | Optional | Benchmark ground truth, `yes` or `no`, used for final evaluation |
+| Field | Requirement |
+| --- | --- |
+| `id` | A unique, nonempty string for this query–document pair; sequential IDs are sufficient |
+| `query` | The complete predicate, with any claim, name, or specification filled in |
+| `document` | The complete, nonempty source text |
+| `label` | Optional benchmark ground truth, exactly `yes` or `no`; supply it for all records or omit it for all records |
 
-Sequential IDs are sufficient. Give different IDs to the same document evaluated against different queries. The benchmark datasets are supplied separately; the included records illustrate the schema and workflow. A tiny population may select full Oracle fallback.
+Give different IDs to the same document evaluated against different queries. Keep the full document in `document`; evidence is generated automatically.
 
-## 2. Retrieve candidates: BM25 + embedding RRF
+The optional benchmark `label` is used only for final accuracy and Macro-F1. Calibration uses labels requested from the Oracle later in the workflow.
+
+## 2. Retrieve evidence candidates — Terminal A
+
+Reads `data/records.jsonl`. Writes `runs/rrf.jsonl`.
 
 ```bash
 python rrf.py \
@@ -76,11 +90,13 @@ python rrf.py \
   --buffer 5
 ```
 
-Within each document, BlingFire splits sentences into overlapping three-sentence windows with stride 1. BM25 and cosine embedding scores rank these windows; reciprocal rank fusion combines their ranks. The prefix ending at the largest RRF-score gap, plus five windows, becomes the reranker input.
+For each document, BlingFire creates sentence windows of size 3 with stride 1. BM25 and embedding similarity rank those windows within that document. RRF combines the ranks and keeps the prefix ending at the largest score gap, plus five windows.
 
-Output: `runs/rrf.jsonl`, with the original record, sentences, and candidate windows with their three scores.
+The output retains every input record and adds sentences, candidate windows, and retrieval scores.
 
-## 3. Rerank and select evidence
+## 3. Rerank and merge evidence — Terminal A
+
+Reads `runs/rrf.jsonl`. Writes `runs/evidence.jsonl`.
 
 ```bash
 python rerank.py \
@@ -92,11 +108,13 @@ python rerank.py \
   --max-chunks 5
 ```
 
-The cross-encoder reranks the candidates. Select the prefix ending at the largest reranker-score gap, cap it at five windows, and merge sentences in document order, removing overlapping sentence indices. When all scores tie, retain the available prefix up to the cap.
+The reranker scores the surviving windows. Selection ends at the largest reranker-score gap and is capped at five windows. Their sentences are merged in document order, removing overlapping sentence indices. If all scores tie, selection keeps the available prefix up to the cap.
 
-Output: `runs/evidence.jsonl`, including `evidence`, `selected_sentence_indices`, and `selected_chunks`. The full `document` remains available.
+The output adds `evidence`, `selected_sentence_indices`, and `selected_chunks`. It preserves the full `document` for later inference.
 
-## 4. Draw the calibration sample
+## 4. Draw the calibration sample — Terminal A
+
+Reads `runs/evidence.jsonl`. Writes the files under `data/split/`.
 
 ```bash
 python split.py \
@@ -105,18 +123,20 @@ python split.py \
   --seed 42
 ```
 
-The default calibration size is `min(N, max(500, ceil(0.01*N)))`. To use a fixed sample budget, add `--size 1000`, with a value no larger than N. Fix that budget before requesting Oracle labels.
+The default sample size is `min(N, max(500, ceil(0.01*N)))`. To choose a fixed budget, add `--size 1000`, with a value between 1 and N. The sample is drawn uniformly without replacement, and its file preserves the random draw order.
 
-| Output | Contents |
-| --- | --- |
-| `data/split/population.jsonl` | All N records, in original order |
-| `data/split/calibration.jsonl` | Uniform sample without replacement, in random draw order |
-| `data/split/remaining.jsonl` | Complement of the calibration sample |
-| `data/split/split.json` | Population size, calibration size, and seed |
+| File | Meaning | Used by |
+| --- | --- | --- |
+| `data/split/population.jsonl` | All N records in original order | Stage 1, threshold search, routing, and final assembly |
+| `data/split/calibration.jsonl` | Calibration subset S, still part of the population | Calibration Oracle calls and threshold search |
+| `data/split/remaining.jsonl` | Population records outside S | Optional inspection of the sample complement |
+| `data/split/split.json` | Sample sizes and random seed | Inspection |
 
-The calibration sample belongs to the certified population. All Stage-1 inference and WS&R population counts use `population.jsonl`. The next steps use predictions and text; Oracle labels are requested in Step 9.
+The certified population includes the calibration records. Later commands use `population.jsonl` as their population input. With the three-record example, the default calibration sample contains all three records.
 
-## 5. Prepare both NS embedding views
+## 5. Prepare the two NS vector files — Terminal A
+
+Reads `data/split/population.jsonl`. Writes both NPZ files below.
 
 ```bash
 python ns.py embed \
@@ -128,13 +148,15 @@ python ns.py embed \
   --batch-size 16
 ```
 
-Each NPZ contains IDs and normalized vectors. Stage 1 uses query + evidence vectors; Stage 2 uses query + full-document vectors. Its neighbor search later selects only records in the fixed maximal Stage-2 pool.
+`evidence_vectors.npz` contains embeddings of query + evidence. `document_vectors.npz` contains embeddings of query + full document. Each file stores record IDs and normalized vectors.
 
-Complete Steps 2–5 before starting the SLM server on the same GPU. Each local model command releases its GPU memory when it exits. Subsequent NS scoring reads these vectors and runs on CPU.
+This command prepares vectors. NS scores are computed after the corresponding SLM predictions exist. Stage-2 NS later searches only within its maximal Stage-2 pool.
 
-## 6. Start the SLM server in a second terminal
+Complete the local retrieval, reranking, and vector commands before starting the SLM server on the same GPU. These commands release their model memory when they exit; NS scoring uses the saved vectors on CPU.
 
-Keep the first terminal in `.venv`. Open the second terminal at the extracted artifact root and create a separate vLLM environment:
+## 6. Start the SLM server — Terminal B
+
+Open Terminal B at the artifact root. Keep Terminal A available for the next commands.
 
 ```bash
 python -m venv .venv-vllm
@@ -147,13 +169,13 @@ vllm serve Qwen/Qwen3-4B-Instruct-2507 \
   --generation-config vllm
 ```
 
-Keep the server running through Step 8.
+Wait for the server to report that it is ready to accept requests. Leave this terminal running during both SLM stages.
 
-The SLM endpoint must expose token log probabilities and vLLM's `logprob_token_ids` option. Both chat endpoints must accept `max_completion_tokens`. Model interfaces follow the official [Qwen embedding](https://huggingface.co/Qwen/Qwen3-Embedding-4B), [Qwen reranker](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B), and [vLLM log-probability](https://docs.vllm.ai/en/stable/api/vllm/sampling_params/) documentation.
+The client `--model` value must match `--served-model-name`. The client `--tokenizer` must match the model behind that endpoint. If your server uses authentication, set its key in Terminal A and pass `--api-key-env SLM_API_KEY` to the SLM inference commands.
 
-## 7. Run Stage 1 and compute NS₁
+## 7. Run Stage 1, then compute NS₁ — Terminal A
 
-Back in the first terminal:
+First run batched inference over the complete population:
 
 ```bash
 python inference.py stage1 \
@@ -167,7 +189,15 @@ python inference.py stage1 \
   --batch-token-budget 8192 \
   --context-window 32768 \
   --score-temperature 15
+```
 
+Stage 1 puts several query–evidence records into each prompt with DocID delimiters. The 8,192-token input budget includes instructions and the chat template. Completion space is reserved separately within the 32,768-token context limit.
+
+At each output label, the code reads Y and N probabilities using matching whitespace tokenization. Malformed output, missing paired probabilities, or evidence exceeding the input budget causes deferral.
+
+Next compute neighbor support and freeze the Stage-1 grid:
+
+```bash
 python ns.py score \
   --stage stage1 \
   --input data/split/population.jsonl \
@@ -181,20 +211,18 @@ python ns.py score \
   --grid-size 32
 ```
 
-Stage 1 packs several query–evidence pairs into one prompt with DocID delimiters. The 8,192-token input budget includes the chat template and instructions. Output space is reserved separately within the SLM context limit. The two label probabilities are compared at the same output position with matching whitespace tokenization. Malformed output, missing paired label probabilities, or an oversized evidence record causes deferral.
+| Output | Contents |
+| --- | --- |
+| `runs/stage1.jsonl` | Predictions, base scores, and token usage |
+| `runs/stage1_scores.jsonl` | Predictions with NS and final routing scores |
+| `runs/grid1.json` | Up to 32 unique routing-score quantiles, forming Λ₁ |
+| `runs/stage2_input.jsonl` | Maximal Stage-2 pool |
 
-The prediction is `yes` when `margin = log p(Y) - log p(N)` is positive, and `no` otherwise. The base score is `sigmoid(margin / 15)`, matching the signed-margin definition. A confident negative prediction therefore has a base score below 0.5; this score is distinct from confidence in the predicted class.
+The maximal pool contains records with a Stage-1 score below `max(Λ₁)`, plus invalid Stage-1 records. It covers every record that any candidate Stage-1 threshold could defer.
 
-NS uses predictions from the same stage, excludes self, and weights agreement by nonnegative cosine similarity. It shrinks support toward 0.5 using median neighborhood mass, then adjusts the confidence in log-odds space. NS reads no benchmark or Oracle labels.
+## 8. Run Stage 2, then compute NS₂ — Terminal A
 
-Outputs:
-
-- `runs/stage1.jsonl`: predictions, base confidence, and token usage.
-- `runs/stage1_scores.jsonl`: predictions with NS and routing scores.
-- `runs/grid1.json`: up to 32 unique score quantiles.
-- `runs/stage2_input.jsonl`: records below the largest Stage-1 threshold, plus invalid Stage-1 records; this is the maximal Stage-2 pool.
-
-## 8. Run Stage 2 and compute NS₂
+Read the full document for each record in the maximal Stage-2 pool:
 
 ```bash
 python inference.py full \
@@ -207,7 +235,13 @@ python inference.py full \
   --seed 42 \
   --context-window 32768 \
   --score-temperature 15
+```
 
+Here `full` selects full-document input. The `--input` file determines which records receive calls. Each record receives one call.
+
+Compute NS₂ within this fixed maximal pool and freeze Λ₂:
+
+```bash
 python ns.py score \
   --stage stage2 \
   --input runs/stage2_input.jsonl \
@@ -220,19 +254,19 @@ python ns.py score \
   --grid-size 64
 ```
 
-Stage 2 performs one full-document call per record in the maximal pool. Its NS neighbors and median mass are computed within that fixed pool. `grid2.json` contains up to 64 unique score quantiles.
+The output grid contains up to 64 unique quantiles. Both stages' predictions, NS scores, and grids are now fixed. Threshold search reuses these stored results for every candidate pair.
 
-This pass supplies every candidate's Stage-2 result. Threshold search reuses these results, so it needs no further SLM calls. Both score files and grids are now fixed. You can stop the SLM server with Ctrl+C in its terminal.
+The SLM work is complete. Stop the server with Ctrl+C in Terminal B. Continue in Terminal A.
 
-## 9. Label the calibration sample with the Oracle
+## 9. Obtain Oracle labels for the calibration sample — Terminal A
 
-Set the credential in the first terminal:
+Set the credential:
 
 ```bash
 export ORACLE_API_KEY="your-key"
 ```
 
-Replace `YOUR_ORACLE_MODEL` with your provider's actual model name in this command and the residual Oracle command in Step 12. For a different provider, replace the base URL in both commands too.
+Replace `YOUR_ORACLE_MODEL` with the actual served model name. Use the same Oracle model, endpoint, and decoding options for calibration and residual calls.
 
 ```bash
 python inference.py full \
@@ -246,13 +280,13 @@ python inference.py full \
   --max-output-tokens 16
 ```
 
-Stage 2 and the Oracle share `full_inference` and the same query/full-document prompt. The `--oracle` flag selects binary-label parsing and skips SLM confidence extraction. The response must be exactly `Y` or `N`.
+The `--oracle` flag selects binary-label parsing and skips SLM score extraction. The prompt contains the query and full document; the response must be exactly `Y` or `N`. The output contains predictions and measured token usage.
 
-Use a non-thinking Oracle mode for this short completion budget. If the provider supports it, append `--reasoning-effort none` to **both** Oracle commands. For a vLLM model with a thinking chat template, `--disable-thinking` sends `enable_thinking=false`. Use the same model and decoding options for calibration and residual calls.
+Use a non-thinking mode for this short completion budget. Append `--reasoning-effort none` if your provider supports that option. For a vLLM model with a thinking chat template, use `--disable-thinking`. Apply the same option to the residual Oracle command.
 
-Output: `runs/oracle_calibration.jsonl`, with Oracle predictions and token usage. The input `label` field remains reserved for final evaluation.
+## 10. Fit the two thresholds — Terminal A
 
-## 10. Select thresholds with WS&R
+Reads the fixed predictions, scores, grids, population, calibration sample, and calibration Oracle labels:
 
 ```bash
 python wsr.py fit \
@@ -273,16 +307,18 @@ python wsr.py fit \
   --oracle-output-tokens 2
 ```
 
-Prices are examples in currency units per million tokens. Replace them with the prices for the models used. Fix `--tau`, `--delta`, prices, and expected Oracle output length before requesting calibration labels; those arguments appear together here because this command consumes them.
+Prices are examples per million tokens. Choose the prices and expected Oracle output length before calibration, using the models you actually select.
 
-For each λ₁, scan λ₂ from largest to smallest. An accepted SLM prediction contributes loss 1 when it disagrees with the Oracle; fallback contributes loss 0. Evaluate WS&R betting wealth at `epsilon = 1 - tau`, with residual-population centering and clipped, predictable aGRAPA-style bets. Each track uses the level `delta / number_of_lambda1_tracks`; stop at the first failed candidate. Select the cheapest certified pair. An empty certified set selects full Oracle fallback.
+For each fixed λ₁, the search scans λ₂ from largest to smallest. It certifies a contiguous prefix and stops that track at its first failure. Every candidate in a track uses the level `delta / number_of_lambda1_tracks`. The selected pair has the lowest estimated cost among the certified pairs.
 
-Outputs:
+| Output | Contents |
+| --- | --- |
+| `runs/search/policy.json` | Selected thresholds, frozen grids, calibration IDs, assumptions, and fallback status |
+| `runs/search/candidates.jsonl` | Visited candidates, certification decisions, routing counts, and estimated costs |
 
-- `runs/search/policy.json`: selected thresholds, frozen grids, calibration IDs, target, track level, price assumptions, and fallback status.
-- `runs/search/candidates.jsonl`: candidates visited during the fixed-sequence scans, with certification results and estimated costs.
+If no candidate is certified, `policy.json` has `selected: null` and `fallback: "all_oracle"`. Routing then resolves the population with Oracle labels. Small calibration samples can produce this result.
 
-## 11. Apply the selected thresholds
+## 11. Route the population — Terminal A
 
 ```bash
 python wsr.py route \
@@ -297,16 +333,23 @@ python wsr.py route \
 Each record takes the first qualifying path:
 
 ```text
-Stage-1 score >= lambda1 → Stage-1 prediction
-otherwise, Stage-2 score >= lambda2 → Stage-2 prediction
-otherwise → Oracle
+Stage-1 score >= lambda1 → use the Stage-1 prediction
+otherwise, Stage-2 score >= lambda2 → use the Stage-2 prediction
+otherwise → use the Oracle label
 ```
 
-Outputs: `runs/route/accepted.jsonl` and `runs/route/pending_oracle.jsonl`. Routing uses the same acceptance calculation as fitting and checks the population, maximal Stage-2 pool, grids, and calibration IDs. Reuse the unchanged score files and Oracle labels that produced the policy. A deferred record with an existing calibration Oracle label is resolved immediately using that stored label.
+Routing reuses the fitted scores and the same acceptance calculation as fitting. It checks the population, maximal Stage-2 pool, grids, and calibration IDs. A deferred record with an existing calibration Oracle label is resolved from that label immediately.
 
-## 12. Run the residual Oracle calls and merge
+| Output | Contents |
+| --- | --- |
+| `runs/route/accepted.jsonl` | Results already resolved by an SLM stage or a stored calibration Oracle label |
+| `runs/route/pending_oracle.jsonl` | Full input records that still require an Oracle call |
 
-Use the same Oracle model, endpoint, and decoding options as Step 9:
+`data/split/remaining.jsonl` is the calibration-sample complement. `runs/route/pending_oracle.jsonl` is the final unresolved set after routing and calibration-label reuse. The residual Oracle command reads `pending_oracle.jsonl`.
+
+## 12. Complete the Oracle residual and assemble results — Terminal A
+
+Use the same Oracle identity and decoding settings as the calibration call:
 
 ```bash
 python inference.py full \
@@ -326,53 +369,104 @@ python wsr.py merge \
   --output-dir runs/final
 ```
 
-An empty pending file produces an empty Oracle output without contacting a model.
+An empty pending file produces an empty Oracle output without contacting a model. Final assembly checks that resolved results and new Oracle results partition the population.
 
-The final deliverables are:
-
-| File | Contents |
+| Final file | Contents |
 | --- | --- |
-| `runs/final/predictions.jsonl` | One prediction per record, in original population order |
-| `runs/final/summary.json` | Stage counts; accuracy and macro-F1 when all input records have `label` |
+| `runs/final/predictions.jsonl` | One prediction per population record, in original order |
+| `runs/final/summary.json` | Stage counts; accuracy and Macro-F1 when all records have benchmark labels |
 
-For evaluation, supply `yes`/`no` labels for every population record, or omit labels entirely. Macro-F1 averages per-class F1 over labels present in the reference or predictions, including single-class populations, following the [standard macro averaging definition](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html).
-
-Example final row:
+Each prediction row has this format:
 
 ```json
-{"id":"q1-d1","prediction":"yes","stage":"stage1"}
+{"id":"review-1","prediction":"yes","stage":"stage1"}
 ```
 
-## CLI reference
+The `stage` value is `stage1`, `stage2`, or `oracle`. Stage counts sum to N. Accuracy is the fraction of predictions matching the optional benchmark labels. Macro-F1 averages class-wise F1 over labels present in the references or predictions, including single-class populations.
 
-Each entry point exposes its arguments through `--help`. The important controls are:
+## Parameter meanings
 
-| Command | Arguments and defaults |
+Each script provides its arguments through `--help`.
+
+| Argument | Meaning |
 | --- | --- |
-| `python rrf.py` | `--embedding-model Qwen/Qwen3-Embedding-4B`, `--device cuda`, `--batch-size 16`, `--max-length 32768`, `--window-size 3`, `--rrf-k 60`, `--buffer 5` |
-| `python rerank.py` | `--reranker-model Qwen/Qwen3-Reranker-0.6B`, `--device cuda`, `--batch-size 8`, `--max-length 8192`, `--max-chunks 5` |
-| `python split.py` | `--seed 42`; optional `--size` overrides the population-dependent sample size |
-| `python ns.py embed` | `--embedding-model`, `--device cuda`, `--batch-size 16`, `--max-length 32768` |
-| `python ns.py score` | `--k 20`, `--gamma 1`, `--epsilon 0.001`; `--grid-size` defaults to 32/64 for Stage 1/2 |
-| `python inference.py` | Required `--model` and `--base-url`; tokenizer defaults to model; `--temperature 0`, `--score-temperature 15`, `--batch-token-budget 8192`, `--context-window 32768`, `--max-output-tokens 16` |
-| `python wsr.py fit` | `--tau 0.9`, `--delta 0.05`, four token-price arguments, `--oracle-output-tokens 2` |
+| `--model` | Model name recognized by the chat server |
+| `--tokenizer` | Matching tokenizer ID or local directory; defaults to `--model` |
+| `--embedding-model`, `--reranker-model` | Model ID or local model directory for the corresponding local command |
+| `--base-url` | Chat API base URL including `/v1` |
+| `--api-key-env` | Name of the environment variable holding the credential |
+| `--batch-size` | Local embedding/reranking batch size in `rrf.py`, `rerank.py`, or `ns.py embed` |
+| `--batch-token-budget` | Stage-1 packed-prompt input budget; default 8,192 |
+| `--context-window` | SLM input plus completion limit; default 32,768 |
+| `--temperature` | Generation temperature, enforced at 0 |
+| `--score-temperature` | Margin transformation temperature T; default 15 |
+| `--max-output-tokens` | Full-document completion budget; default 16 |
+| `--size` | Fixed calibration size; default `min(N, max(500, ceil(0.01*N)))` |
+| `--k`, `--gamma`, `--epsilon` | NS neighbors, adjustment weight, log-odds smoothing; defaults 20, 1, 0.001 |
+| `--grid-size` | Number of quantile points before duplicate removal; defaults 32 for Stage 1 and 64 for Stage 2 |
+| `--tau`, `--delta` | Target agreement with the Oracle and total failure probability |
 
-Model and tokenizer arguments accept a Hugging Face ID or the appropriate local model path. For a local model served under a short name, use that served name in `--model` and its matching model path in `--tokenizer`. Use `--api-key-env SLM_API_KEY` for an authenticated SLM endpoint after setting that variable. Oracle mode defaults to `ORACLE_API_KEY` when `--api-key-env` is omitted.
+Changing inputs, models, scoring settings, or grids requires rebuilding the affected outputs and downstream files. Freeze the candidate family before requesting the calibration Oracle labels. Use the unchanged score and label files when applying a fitted policy.
 
-## Method and accounting details
+## Scoring and certification definitions
 
-- **Base score:** `b = sigmoid((log p(Y) - log p(N)) / T)` with a signed margin. Both stages use the same definition and temperature. Deterministic decoding is enforced with generation temperature 0.
-- **NS:** similarity-weighted agreement shrinks toward 0.5 with `rho = W / (W + median(W))`; routing adds `gamma * (2 * shrunk_NS - 1)` to smoothed confidence log odds. Invalid neighbor predictions carry zero voting weight. FAISS performs exact cosine search in blocks; compute grows quadratically with pool size.
-- **Betting:** the residual target is `q_t = clip((N*epsilon - sum_previous_errors)/(N-t+1), 0, 1)`. The positive bet uses `(q_t - mu_hat)/(variance_hat + (q_t - mu_hat)^2)`, clipped to `[0, 0.5/(1-q_t)]`. Only previous errors enter its estimates. See [Waudby-Smith and Ramdas, Appendix B.3](https://par.nsf.gov/servlets/purl/10379214) for the underlying aGRAPA rule.
-- **Cost:** candidate selection uses measured SLM usage and estimates Oracle input lengths with the SLM tokenizer and output lengths with `--oracle-output-tokens`. Maximal Stage-2 search and calibration-labeling costs are reported separately. Retrieval/indexing compute and the final provider bill are outside this estimate.
-- **Target:** certification concerns agreement with the fixed Oracle on this finite population. Benchmark accuracy and macro-F1 use the optional `label`. Keep models, decoding, score parameters, grids, sample budget, tau, and delta fixed before observing calibration labels.
+The base score uses a signed margin:
 
-After changing the score definition or updating to this signed-margin revision, regenerate Stage-1 scores, the maximal Stage-2 inputs and predictions, both grids, and the fitted policy before routing. The commands in Steps 7–12 perform that sequence.
+```text
+margin     = log p(Y) - log p(N)
+prediction = yes if margin > 0, otherwise no
+b          = sigmoid(margin / T)
+```
 
-## File tree
+A confident negative prediction has `b < 0.5`. The score represents the signed Y/N preference. The implementation compares paired label tokens at the same output position and with the same whitespace form.
+
+NS uses top-K cosine neighbors within the stage's own pool, excludes self, and gives invalid neighbor predictions zero voting weight:
+
+```text
+w_ij        = max(cosine(v_i, v_j), 0)
+W_i         = sum_j w_ij
+NS_i        = weighted fraction of neighbors agreeing with prediction_i
+rho_i       = W_i / (W_i + median(W))
+shrunk_NS_i = rho_i * NS_i + (1 - rho_i) * 0.5
+score_i     = log((b_i + epsilon_log) / (1 - b_i + epsilon_log))
+              + gamma * (2 * shrunk_NS_i - 1)
+```
+
+Here `epsilon_log` is the `ns.py score --epsilon` smoothing parameter, default 0.001. Zero neighbor mass gives neutral support; a zero shrinkage denominator sets rho to 0. Stage 1 uses the whole population as its pool; Stage 2 uses the fixed maximal Stage-2 pool. FAISS performs exact cosine search in blocks, so compute grows quadratically with pool size.
+
+For calibration, a record has loss 1 when an accepted SLM prediction disagrees with the Oracle. Oracle fallback has loss 0. The residual-centred betting calculation is:
+
+```text
+error_target = 1 - tau
+q_t     = clip((N * error_target - sum_previous_errors) / (N - t + 1), 0, 1)
+bet_t   = clip((q_t - mu_hat) / (variance_hat + (q_t - mu_hat)^2),
+               0, 0.5 / (1 - q_t))
+M_n     = product_t (1 + bet_t * (q_t - error_t))
+```
+
+The mean and variance estimates use previous errors only. At q_t = 1, the bet's upper cap is unbounded. A candidate passes when `M_n >= number_of_lambda1_tracks / delta`. Certification targets agreement with the fixed Oracle on this finite population; optional benchmark labels provide a separate evaluation.
+
+Candidate selection uses measured SLM token usage and estimated Oracle costs. Oracle input lengths use the SLM tokenizer; output lengths use `--oracle-output-tokens`. Search-pass and calibration-labeling costs are reported separately. Retrieval/indexing compute and the final provider bill are outside this estimate.
+
+Public interface and formula references: [embedding model](https://huggingface.co/Qwen/Qwen3-Embedding-4B), [reranker](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B), [vLLM log probabilities](https://docs.vllm.ai/en/stable/api/vllm/sampling_params/), [aGRAPA definition](https://par.nsf.gov/servlets/purl/10379214), [Macro-F1 definition](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html).
+
+## Common execution issues
+
+| Symptom | Action |
+| --- | --- |
+| Chat endpoint connection fails | Keep Terminal B running and match the client base URL and served model name |
+| Local embedding/reranking runs out of GPU memory | Reduce that command's `--batch-size`; complete local model work before starting vLLM |
+| Full document exceeds the SLM context | Choose a supported longer context in both the server and client before running the population |
+| Many SLM rows have missing paired probabilities | Use a vLLM endpoint supporting `logprob_token_ids` and a tokenizer matching its served model |
+| Stage-2 IDs differ from the maximal pool | Regenerate the maximal pool and its downstream predictions, scores, grids, and policy together |
+| No threshold pair is certified | Inspect `policy.json`; full Oracle fallback is the defined outcome |
+| Final metrics reject benchmark labels | Supply valid labels for every record, or omit benchmark labels entirely |
+
+## Files
 
 ```text
 anonymous-artifact/
+├── .gitignore
 ├── README.md
 ├── requirements.txt
 ├── examples/
@@ -385,4 +479,6 @@ anonymous-artifact/
 └── wsr.py
 ```
 
-The six scripts are independent entry points. They exchange files through explicit CLI paths and import no other project script. Input/output and model helpers stay inside the scripts that use them. Stage 2 and the Oracle share one full-document function inside `inference.py`. Generated data and results live under `data/` and `runs/`.
+The six scripts are independent entry points and import no other project script. They exchange data through explicit CLI input/output paths. Each script contains its own small I/O and model helpers. Generated data, vectors, and results live under `data/` and `runs/`.
+
+The anonymous distribution contains these source files and the synthetic example. It excludes Git metadata, credentials, local environments, model weights, and generated runs.
