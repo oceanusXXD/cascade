@@ -37,10 +37,13 @@ class Embedder:
 
     def encode(self, texts, *, query=False):
         prompt = "Instruct: Given a predicate, retrieve relevant evidence from the document\nQuery: " if query else ""
-        return np.asarray(self.model.encode(
+        vectors = np.asarray(self.model.encode(
             texts, prompt=prompt, batch_size=self.batch_size,
             normalize_embeddings=True, show_progress_bar=False,
         ), dtype=np.float32)
+        if vectors.ndim != 2 or vectors.shape[0] != len(texts) or not vectors.shape[1] or not np.isfinite(vectors).all():
+            raise ValueError("Invalid embedding vectors")
+        return vectors
 
 
 def bm25_scores(query, chunks):
@@ -66,6 +69,10 @@ def rank_positions(scores):
 
 
 def retrieve(row, embedder, *, window_size=3, rrf_k=60, buffer=5):
+    if not isinstance(row["query"], str) or not row["query"].strip():
+        raise ValueError(f"{row['id']}: query is empty")
+    if not isinstance(row["document"], str):
+        raise ValueError(f"{row['id']}: document must be text")
     sentences = text_to_sentences(row["document"]).splitlines()
     sentences = [text.strip() for text in sentences if text.strip()]
     if not sentences:

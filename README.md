@@ -10,7 +10,7 @@ The pipeline evaluates a natural-language predicate on each document using three
 | 2 | Full document | One SLM call per record |
 | 3 | Full document | One Oracle call per residual record |
 
-Each SLM stage produces a prediction and a confidence. Neighbor Support (NS) adjusts that confidence using nearby predictions. A single calibration sample then certifies the two acceptance thresholds jointly using WS&R, with **fixed-sequence scanning within each λ₁ track and Bonferroni across tracks**.
+Each SLM stage produces a prediction and a base score from its signed Y/N log-probability margin. Neighbor Support (NS) adjusts that score using nearby predictions. A single calibration sample then certifies the two acceptance thresholds jointly using WS&R, with **fixed-sequence scanning within each λ₁ track and Bonferroni across tracks**.
 
 All settings are command-line arguments. The commands below are the complete workflow, in execution order.
 
@@ -181,7 +181,9 @@ python ns.py score \
   --grid-size 32
 ```
 
-Stage 1 packs several query–evidence pairs into one prompt with DocID delimiters. The 8,192-token input budget includes the chat template and instructions. Output space is reserved separately within the SLM context limit. Malformed output, missing paired label probabilities, or an oversized evidence record causes deferral.
+Stage 1 packs several query–evidence pairs into one prompt with DocID delimiters. The 8,192-token input budget includes the chat template and instructions. Output space is reserved separately within the SLM context limit. The two label probabilities are compared at the same output position with matching whitespace tokenization. Malformed output, missing paired label probabilities, or an oversized evidence record causes deferral.
+
+The prediction is `yes` when `margin = log p(Y) - log p(N)` is positive, and `no` otherwise. The base score is `sigmoid(margin / 15)`, matching the signed-margin definition. A confident negative prediction therefore has a base score below 0.5; this score is distinct from confidence in the predicted class.
 
 NS uses predictions from the same stage, excludes self, and weights agreement by nonnegative cosine similarity. It shrinks support toward 0.5 using median neighborhood mass, then adjusts the confidence in log-odds space. NS reads no benchmark or Oracle labels.
 
@@ -277,7 +279,7 @@ For each λ₁, scan λ₂ from largest to smallest. An accepted SLM prediction 
 
 Outputs:
 
-- `runs/search/policy.json`: selected thresholds, target, track level, price assumptions, and fallback status.
+- `runs/search/policy.json`: selected thresholds, frozen grids, calibration IDs, target, track level, price assumptions, and fallback status.
 - `runs/search/candidates.jsonl`: candidates visited during the fixed-sequence scans, with certification results and estimated costs.
 
 ## 11. Apply the selected thresholds
@@ -300,7 +302,7 @@ otherwise, Stage-2 score >= lambda2 → Stage-2 prediction
 otherwise → Oracle
 ```
 
-Outputs: `runs/route/accepted.jsonl` and `runs/route/pending_oracle.jsonl`. A deferred record with an existing calibration Oracle label is resolved immediately using that stored label.
+Outputs: `runs/route/accepted.jsonl` and `runs/route/pending_oracle.jsonl`. Routing uses the same acceptance calculation as fitting and checks the population, maximal Stage-2 pool, grids, and calibration IDs. Reuse the unchanged score files and Oracle labels that produced the policy. A deferred record with an existing calibration Oracle label is resolved immediately using that stored label.
 
 ## 12. Run the residual Oracle calls and merge
 
@@ -331,7 +333,9 @@ The final deliverables are:
 | File | Contents |
 | --- | --- |
 | `runs/final/predictions.jsonl` | One prediction per record, in original population order |
-| `runs/final/summary.json` | Stage counts; accuracy and binary macro-F1 when all input records have `label` |
+| `runs/final/summary.json` | Stage counts; accuracy and macro-F1 when all input records have `label` |
+
+For evaluation, supply `yes`/`no` labels for every population record, or omit labels entirely. Macro-F1 averages per-class F1 over labels present in the reference or predictions, including single-class populations, following the [standard macro averaging definition](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html).
 
 Example final row:
 
@@ -357,11 +361,13 @@ Model and tokenizer arguments accept a Hugging Face ID or the appropriate local 
 
 ## Method and accounting details
 
-- **Confidence:** this implementation uses `sigmoid(abs(log p(Y) - log p(N)) / T)`, confidence in the predicted label. Positive and negative predictions use the same confidence definition.
+- **Base score:** `b = sigmoid((log p(Y) - log p(N)) / T)` with a signed margin. Both stages use the same definition and temperature. Deterministic decoding is enforced with generation temperature 0.
 - **NS:** similarity-weighted agreement shrinks toward 0.5 with `rho = W / (W + median(W))`; routing adds `gamma * (2 * shrunk_NS - 1)` to smoothed confidence log odds. Invalid neighbor predictions carry zero voting weight. FAISS performs exact cosine search in blocks; compute grows quadratically with pool size.
 - **Betting:** the residual target is `q_t = clip((N*epsilon - sum_previous_errors)/(N-t+1), 0, 1)`. The positive bet uses `(q_t - mu_hat)/(variance_hat + (q_t - mu_hat)^2)`, clipped to `[0, 0.5/(1-q_t)]`. Only previous errors enter its estimates. See [Waudby-Smith and Ramdas, Appendix B.3](https://par.nsf.gov/servlets/purl/10379214) for the underlying aGRAPA rule.
 - **Cost:** candidate selection uses measured SLM usage and estimates Oracle input lengths with the SLM tokenizer and output lengths with `--oracle-output-tokens`. Maximal Stage-2 search and calibration-labeling costs are reported separately. Retrieval/indexing compute and the final provider bill are outside this estimate.
 - **Target:** certification concerns agreement with the fixed Oracle on this finite population. Benchmark accuracy and macro-F1 use the optional `label`. Keep models, decoding, score parameters, grids, sample budget, tau, and delta fixed before observing calibration labels.
+
+After changing the score definition or updating to this signed-margin revision, regenerate Stage-1 scores, the maximal Stage-2 inputs and predictions, both grids, and the fitted policy before routing. The commands in Steps 7–12 perform that sequence.
 
 ## File tree
 

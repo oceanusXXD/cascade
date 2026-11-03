@@ -39,10 +39,13 @@ class Embedder:
 
     def encode(self, texts, *, query=False):
         prompt = "Instruct: Given a predicate, retrieve relevant evidence from the document\nQuery: " if query else ""
-        return np.asarray(self.model.encode(
+        vectors = np.asarray(self.model.encode(
             texts, prompt=prompt, batch_size=self.batch_size,
             normalize_embeddings=True, show_progress_bar=False,
         ), dtype=np.float32)
+        if vectors.ndim != 2 or vectors.shape[0] != len(texts) or not vectors.shape[1] or not np.isfinite(vectors).all():
+            raise ValueError("Invalid embedding vectors")
+        return vectors
 
 
 def neighbor_support(vectors, predictions, *, k=20):
@@ -69,7 +72,7 @@ def neighbor_support(vectors, predictions, *, k=20):
             mass[current] = weights.sum()
             if mass[current] > 0 and predictions[current] in {"yes", "no"}:
                 agrees = np.array([predictions[j] == predictions[current] for j in indices])
-                support[current] = float(weights @ agrees / mass[current])
+                support[current] = min(1.0, max(0.0, float(weights @ agrees / mass[current])))
     return support, mass
 
 
@@ -79,6 +82,8 @@ def score_rows(rows, predictions, vectors, *, k=20, gamma=1, epsilon=0.001):
         raise ValueError("Prediction IDs must match the stage input IDs")
     if not rows:
         return []
+    if vectors.ndim != 2 or len(vectors) != len(rows) or not np.isfinite(vectors).all():
+        raise ValueError("Vectors must be finite and align with the stage inputs")
     labels = [by_id[row["id"]]["prediction"] for row in rows]
     support, mass = neighbor_support(vectors, labels, k=k)
     sigma_sq = float(np.median(mass))
@@ -90,6 +95,8 @@ def score_rows(rows, predictions, vectors, *, k=20, gamma=1, epsilon=0.001):
         base = prediction.get("base_confidence")
         score = None
         if labels[i] in {"yes", "no"} and base is not None:
+            if not np.isfinite(base) or not 0 <= base <= 1:
+                raise ValueError(f"{row['id']}: base confidence must be in [0, 1]")
             score = float(np.log((base + epsilon) / (1 - base + epsilon)) + gamma * (2 * shrunk[i] - 1))
         results.append({**prediction, "neighbor_support": float(support[i]), "neighbor_mass": float(mass[i]),
                         "shrunk_support": float(shrunk[i]), "score": score})
@@ -142,8 +149,10 @@ def main():
     predictions = read_rows(args.predictions)
     with np.load(args.vectors) as saved:
         positions = {key: i for i, key in enumerate(saved["ids"].tolist())}
+        if len(positions) != len(saved["ids"]) or any(row["id"] not in positions for row in rows):
+            parser.error("vector IDs must be unique and cover the stage inputs")
         vectors = saved["vectors"][[positions[row["id"]] for row in rows]]
-    if args.k < 1 or args.gamma < 0 or args.epsilon <= 0:
+    if not np.isfinite([args.gamma, args.epsilon]).all() or args.k < 1 or args.gamma < 0 or args.epsilon <= 0:
         parser.error("k and epsilon must be positive; gamma must be nonnegative")
     scored = score_rows(rows, predictions, vectors, k=args.k, gamma=args.gamma, epsilon=args.epsilon)
     finite = [row["score"] for row in scored if row["score"] is not None]

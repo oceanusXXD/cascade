@@ -77,39 +77,48 @@ def full_messages(row):
             {"role": "user", "content": f"Query: {row['query']}\nDocument:\n{row['document']}"}]
 
 
-def token_count(tokenizer, messages):
-    return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True))
+def token_count(tokenizer, messages, *, disable_thinking=False):
+    options = {"enable_thinking": False} if disable_thinking else {}
+    return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, **options))
 
 
 def binary_token_ids(tokenizer):
     ids = []
-    for label in ("Y", "N", " Y", " N"):
-        tokens = tokenizer.encode(label, add_special_tokens=False)
-        if len(tokens) == 1:
-            ids.append(tokens[0])
-    if any(len(tokenizer.encode(label, add_special_tokens=False)) != 1 for label in ("Y", "N")):
-        raise ValueError("The SLM tokenizer must encode Y and N as single tokens")
+    for prefix in ("", " "):
+        pair = [tokenizer.encode(prefix + label, add_special_tokens=False) for label in ("Y", "N")]
+        if all(len(tokens) == 1 for tokens in pair):
+            ids.extend(tokens[0] for tokens in pair)
+        elif prefix == "":
+            raise ValueError("The SLM tokenizer must encode Y and N as single tokens")
     return sorted(set(ids))
+
+
+def token_text(item):
+    value = getattr(item, "bytes", None)
+    return bytes(value).decode("utf-8", errors="replace") if value is not None else item.token
 
 
 def label_score(choice, start, end, temperature):
     offset = 0
     for item in choice.logprobs.content:
-        token_end = offset + len(item.token)
+        observed = token_text(item)
+        token_end = offset + len(observed)
         if offset <= start and end <= token_end:
-            alternatives = {}
-            for candidate in [item, *item.top_logprobs]:
-                name = candidate.token.strip()
-                if name in {"Y", "N"}:
-                    alternatives[name] = max(alternatives.get(name, -math.inf), candidate.logprob)
-            if set(alternatives) != {"Y", "N"}:
+            if observed.strip() not in {"Y", "N"}:
                 return None
-            margin = alternatives["Y"] - alternatives["N"]
+            prefix, suffix = observed[:start - offset], observed[end - offset:]
+            alternatives = {token_text(candidate): candidate.logprob for candidate in [item, *item.top_logprobs]}
+            yes = alternatives.get(prefix + "Y" + suffix)
+            no = alternatives.get(prefix + "N" + suffix)
+            if yes is None or no is None:
+                return None
+            margin = yes - no
             if not math.isfinite(margin):
                 return None
+            scaled = margin / temperature
+            confidence = 1 / (1 + math.exp(-scaled)) if scaled >= 0 else math.exp(scaled) / (1 + math.exp(scaled))
             return {"prediction": "yes" if margin > 0 else "no",
-                    "yes_logprob": alternatives["Y"], "no_logprob": alternatives["N"],
-                    "base_confidence": 1 / (1 + math.exp(-abs(margin) / temperature))}
+                    "yes_logprob": yes, "no_logprob": no, "base_confidence": confidence}
         offset = token_end
     return None
 
@@ -119,7 +128,7 @@ def parse_slm(choice, count, *, batched, temperature):
     logprobs = choice.logprobs
     invalid = [{"prediction": None, "base_confidence": None, "defer_reason": "malformed_output_or_missing_logprobs"}
                for _ in range(count)]
-    if not logprobs or not logprobs.content or "".join(item.token for item in logprobs.content) != text:
+    if not logprobs or not logprobs.content or "".join(token_text(item) for item in logprobs.content) != text:
         return invalid
     if batched:
         matches = list(re.finditer(r"(?m)^[ \t]*(\d+):[ \t]*([YN])[ \t]*$", text))
@@ -139,7 +148,7 @@ def parse_slm(choice, count, *, batched, temperature):
 def full_inference(row, model, *, tokenizer=None, label_ids=None, temperature=15, context_window=32768,
                    max_tokens=16):
     messages = full_messages(row)
-    if tokenizer is not None and token_count(tokenizer, messages) + max_tokens > context_window:
+    if tokenizer is not None and token_count(tokenizer, messages, disable_thinking=model.disable_thinking) + max_tokens > context_window:
         raise ValueError(f"{row['id']}: full document exceeds the configured SLM context window")
     response = model.complete(messages, max_tokens=max_tokens, label_token_ids=label_ids)
     choice = response.choices[0]
@@ -168,22 +177,22 @@ def batch_inference(rows, model, tokenizer, *, batch_token_budget=8192, context_
             yield {"id": row["id"], **result,
                    "input_tokens": response.usage.prompt_tokens / len(batch),
                    "output_tokens": response.usage.completion_tokens / len(batch),
-                   "full_input_tokens": token_count(tokenizer, full_messages(row))}
+                   "full_input_tokens": token_count(tokenizer, full_messages(row), disable_thinking=model.disable_thinking)}
 
     batch = []
     for row in rows:
         candidate = batch + [row]
-        length = token_count(tokenizer, batch_messages(candidate))
+        length = token_count(tokenizer, batch_messages(candidate), disable_thinking=model.disable_thinking)
         fits = length <= budget and length + max(16, 8 * len(candidate)) <= context_window
         if not fits and batch:
             yield from run_batch(batch)
             batch = []
         if not batch:
-            length = token_count(tokenizer, batch_messages([row]))
+            length = token_count(tokenizer, batch_messages([row]), disable_thinking=model.disable_thinking)
             if length > budget or length + 16 > context_window:
                 yield {"id": row["id"], "prediction": None, "base_confidence": None,
                        "defer_reason": "evidence_exceeds_batch_budget", "input_tokens": 0, "output_tokens": 0,
-                       "full_input_tokens": token_count(tokenizer, full_messages(row))}
+                       "full_input_tokens": token_count(tokenizer, full_messages(row), disable_thinking=model.disable_thinking)}
                 continue
         batch.append(row)
     if batch:
@@ -200,7 +209,7 @@ def main():
     parser.add_argument("--oracle", action="store_true", help="Full-document Oracle mode: binary labels without SLM confidence")
     parser.add_argument("--tokenizer", help="SLM tokenizer ID or local directory; defaults to --model")
     parser.add_argument("--api-key-env", help="Environment variable holding the key; Oracle defaults to ORACLE_API_KEY")
-    parser.add_argument("--temperature", type=float, default=0, help="Generation temperature")
+    parser.add_argument("--temperature", type=float, choices=[0.0], default=0, help="Deterministic generation temperature")
     parser.add_argument("--seed", type=int, help="Generation seed, when supported by the endpoint")
     parser.add_argument("--reasoning-effort", help="Provider reasoning option, e.g. none; use only when supported")
     parser.add_argument("--disable-thinking", action="store_true", help="Send enable_thinking=false to a vLLM chat template")
@@ -211,7 +220,8 @@ def main():
     args = parser.parse_args()
     if args.mode == "stage1" and args.oracle:
         parser.error("--oracle is used with full inference")
-    if min(args.batch_token_budget, args.context_window, args.score_temperature, args.max_output_tokens) <= 0:
+    if not math.isfinite(args.score_temperature) or min(args.batch_token_budget, args.context_window,
+                                                       args.score_temperature, args.max_output_tokens) <= 0:
         parser.error("token budgets and score-temperature must be positive")
     rows = read_rows(args.input)
     if not rows:

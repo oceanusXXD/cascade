@@ -37,6 +37,9 @@ def write_json(path, value):
 
 def betting_log_wealth(errors, population_size, epsilon):
     errors = np.asarray(errors, dtype=float)
+    if (errors.ndim != 1 or not 1 <= errors.size <= population_size or not np.isfinite(errors).all()
+            or np.any((errors < 0) | (errors > 1)) or not 0 <= epsilon <= 1):
+        raise ValueError("Betting requires an ordered bounded sample of size 1 through N")
     t = np.arange(1, len(errors) + 1, dtype=float)
     prefix = np.r_[0.0, np.cumsum(errors)[:-1]]
     q = np.clip((population_size * epsilon - prefix) / (population_size - t + 1), 0, 1)
@@ -48,23 +51,37 @@ def betting_log_wealth(errors, population_size, epsilon):
     return float(np.log1p(bets * (q - errors)).sum())
 
 
+def threshold_grid(values):
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 1 or not values.size or not np.isfinite(values).all():
+        raise ValueError("A threshold grid must be a nonempty finite list")
+    return np.unique(values).tolist()
+
+
 def aligned_stages(population, stage1, stage2, grid1):
     ids = [row["id"] for row in population]
     first = {row["id"]: row for row in stage1}
     second = {row["id"]: row for row in stage2}
-    if set(first) != set(ids):
+    if len(first) != len(stage1) or len(second) != len(stage2) or set(first) != set(ids):
         raise ValueError("Stage-1 IDs must match the population")
-    expected = {key for key in ids if first[key]["score"] is None or first[key]["score"] < max(grid1)}
-    if set(second) != expected:
-        raise ValueError("Stage-2 IDs must match the maximal pool defined by grid1")
 
     def arrays(mapping):
-        scores = np.array([mapping[key]["score"] if key in mapping and mapping[key]["score"] is not None
-                           and mapping[key]["prediction"] in {"yes", "no"} else -np.inf for key in ids])
-        predictions = np.array([mapping.get(key, {}).get("prediction") for key in ids], dtype=object)
-        return scores, predictions
+        scores, predictions = [], []
+        for key in ids:
+            row = mapping.get(key, {})
+            score, prediction = row.get("score"), row.get("prediction")
+            if score is not None and (not math.isfinite(score) or prediction not in {"yes", "no"}):
+                raise ValueError(f"{key}: a finite score requires a binary prediction")
+            scores.append(score if score is not None else -np.inf)
+            predictions.append(prediction)
+        return np.asarray(scores), np.asarray(predictions, dtype=object)
 
-    return first, second, *arrays(first), *arrays(second)
+    score1, pred1 = arrays(first)
+    lambda1_max = max(threshold_grid(grid1))
+    expected = {key for key, score in zip(ids, score1) if score < lambda1_max}
+    if set(second) != expected:
+        raise ValueError("Stage-2 IDs must match the maximal pool defined by grid1")
+    return first, second, score1, pred1, *arrays(second)
 
 
 def model_cost(row, input_price, output_price):
@@ -76,6 +93,7 @@ def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, 
                  oracle_output_tokens=2):
     if not 0 < tau < 1 or not 0 < delta < 1:
         raise ValueError("tau and delta must be in (0, 1)")
+    grid1, grid2 = threshold_grid(grid1), threshold_grid(grid2)
     n_population = len(population)
     if not 1 <= len(calibration) <= n_population:
         raise ValueError("Calibration size must be between 1 and N")
@@ -87,6 +105,10 @@ def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, 
         raise ValueError("Oracle labels must cover exactly the calibration sample")
     if any(label not in {"yes", "no"} for label in labels.values()):
         raise ValueError("Each calibration record needs a binary Oracle prediction")
+    for row in calibration:
+        original = population[positions[row["id"]]]
+        if any(row.get(field) != original.get(field) for field in ("query", "document")):
+            raise ValueError(f"{row['id']}: calibration text differs from the population")
     sample = np.array([positions[row["id"]] for row in calibration])
     truth = np.array([labels[row["id"]] for row in calibration])
     wrong1, wrong2 = pred1[sample] != truth, pred2[sample] != truth
@@ -117,6 +139,8 @@ def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, 
     selected = min(certified, key=lambda row: (row["estimated_deployment_cost"], row["oracle_count"])) if certified else None
     policy = {"tau": tau, "delta": delta, "population_size": n_population,
               "calibration_size": len(calibration), "tracks": tracks, "level_per_track": delta / tracks,
+              "calibration_ids": [row["id"] for row in calibration],
+              "lambda1_grid": grid1, "lambda2_grid": grid2,
               "grid_shape": [len(grid1), len(grid2)], "certified_count": len(certified),
               "stage2_search_cost": float(stage2_costs.sum()),
               "calibration_cost": sum(model_cost(row, oracle_input_price, oracle_output_price) for row in oracle),
@@ -128,20 +152,29 @@ def joint_search(population, stage1, stage2, calibration, oracle, grid1, grid2, 
 
 
 def route(population, stage1, stage2, policy, oracle_calibration):
-    first = {row["id"]: row for row in stage1}
-    second = {row["id"]: row for row in stage2}
+    if len(population) != policy["population_size"]:
+        raise ValueError("The policy population size differs from the routing population")
+    _, _, score1, pred1, score2, pred2 = aligned_stages(population, stage1, stage2, policy["lambda1_grid"])
     oracle = {row["id"]: row["prediction"] for row in oracle_calibration}
+    if set(oracle) != set(policy["calibration_ids"]) or any(label not in {"yes", "no"} for label in oracle.values()):
+        raise ValueError("Routing must reuse the fitted calibration sample's binary Oracle labels")
     selected = policy["selected"]
+    if selected is None:
+        accept1 = accept2 = np.zeros(len(population), dtype=bool)
+    else:
+        if (not selected["certified"] or selected["lambda1"] not in policy["lambda1_grid"]
+                or selected["lambda2"] not in policy["lambda2_grid"]):
+            raise ValueError("The selected pair must be certified and belong to the fitted grids")
+        accept1 = score1 >= selected["lambda1"]
+        accept2 = (~accept1) & (score2 >= selected["lambda2"])
     accepted, pending = [], []
-    for row in population:
+    for i, row in enumerate(population):
         key = row["id"]
         prediction, stage = None, None
-        for name, mapping, threshold_name in (("stage1", first, "lambda1"), ("stage2", second, "lambda2")):
-            value = mapping.get(key, {})
-            score = value.get("score")
-            if selected and score is not None and score >= selected[threshold_name] and value.get("prediction") in {"yes", "no"}:
-                prediction, stage = value["prediction"], name
-                break
+        if accept1[i]:
+            prediction, stage = pred1[i], "stage1"
+        elif accept2[i]:
+            prediction, stage = pred2[i], "stage2"
         if prediction is None and key in oracle:
             prediction, stage = oracle[key], "oracle"
         if prediction is None:
@@ -152,6 +185,8 @@ def route(population, stage1, stage2, policy, oracle_calibration):
 
 
 def merge(population, accepted, oracle):
+    if not population:
+        raise ValueError("The population is empty")
     population_ids = {row["id"] for row in population}
     accepted_ids, oracle_ids = {row["id"] for row in accepted}, {row["id"] for row in oracle}
     if accepted_ids & oracle_ids or (accepted_ids | oracle_ids) != population_ids:
@@ -162,16 +197,19 @@ def merge(population, accepted, oracle):
     if any(row["prediction"] not in {"yes", "no"} for row in results):
         raise ValueError("Every final record needs a binary prediction")
     summary = {"population_size": len(results), "stage_counts": dict(Counter(row["stage"] for row in results))}
-    if population and all(row.get("label") in {"yes", "no"} for row in population):
-        truth = np.array([row["label"] for row in population])
+    labels = [row.get("label") for row in population]
+    if any(label is not None for label in labels):
+        if any(label not in {"yes", "no"} for label in labels):
+            raise ValueError("Evaluation requires yes/no ground truth for every population record")
+        truth = np.array(labels)
         predictions = np.array([row["prediction"] for row in results])
         summary["accuracy"] = float(np.mean(truth == predictions))
         f1 = []
-        for label in ("yes", "no"):
+        for label in sorted(set(truth) | set(predictions)):
             tp = int(((truth == label) & (predictions == label)).sum())
             denominator = int((truth == label).sum() + (predictions == label).sum())
             f1.append(2 * tp / denominator if denominator else 0)
-        summary["macro_f1"] = sum(f1) / 2
+        summary["macro_f1"] = sum(f1) / len(f1)
     return results, summary
 
 
@@ -211,8 +249,9 @@ def main():
     population = read_rows(args.population)
     root = Path(args.output_dir)
     if args.command == "fit":
-        if min(args.slm_input_price, args.slm_output_price, args.oracle_input_price,
-               args.oracle_output_price, args.oracle_output_tokens) < 0:
+        prices = [args.slm_input_price, args.slm_output_price, args.oracle_input_price,
+                  args.oracle_output_price, args.oracle_output_tokens]
+        if not np.isfinite(prices).all() or min(prices) < 0:
             parser.error("prices and expected output tokens must be nonnegative")
         grid1, grid2 = read_json(args.grid1)["thresholds"], read_json(args.grid2)["thresholds"]
         policy, candidates = joint_search(population, read_rows(args.stage1), read_rows(args.stage2),

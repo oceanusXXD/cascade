@@ -43,7 +43,9 @@ class Reranker:
 
 def select_evidence(row, reranker, *, max_chunks=5):
     candidates = row["candidates"]
-    scores = np.asarray(reranker.score(row["query"], [chunk["text"] for chunk in candidates]))
+    if not candidates:
+        raise ValueError(f"{row['id']}: no candidate windows")
+    scores = np.asarray(reranker.score(row["query"], [chunk["text"] for chunk in candidates]), dtype=float).reshape(-1)
     if len(scores) != len(candidates) or not np.all(np.isfinite(scores)):
         raise ValueError(f"{row['id']}: invalid reranker scores")
     order = np.argsort(-scores, kind="stable")
