@@ -319,7 +319,7 @@ Candidate `oracle_count` and `oracle_rate`, and final `stage_counts.oracle` and 
 
 The `ns.py --epsilon` option is log-odds smoothing, corresponding to epsilon_log. The certification error target epsilon is always computed as `1 - tau`.
 
-## Paper-to-code map and coverage
+## Paper-to-code map
 
 | Manuscript component | Implementation |
 | --- | --- |
@@ -330,11 +330,9 @@ The `ns.py --epsilon` option is log-odds smoothing, corresponding to epsilon_log
 | Ordered SRSWOR and zero-error calibration floor | `split.py:sample_calibration`, `betting.py:zero_error_min_size` |
 | Algorithm 2: fixed sequence and track Bonferroni | `wsr.py:joint_search` |
 | Cost objective and cache-aware batch accounting | `wsr.py:prepare_search`, `execution_summary` |
-| Repeated-draw metrics and violations | `wsr.py:merge`, `summarize` |
+| Repeated-draw metrics and violations | `wsr.py` merge command and `summarize_runs` |
 
 Supported score ablations: set `--gamma 0` on either or both stage scoring commands to remove NS; use `--no-shrinkage` for rho=1, or `--uniform-weights` for unit neighbor weights with the median mass recomputed. Rebuild scores, grids, maximal pool when affected, costs and calibration for each variant.
-
-This repository contains the main cascade and these explicit score ablations. The paper's full benchmark populations, annotations, seven baseline implementations, remaining structural/search/score variants, raw per-draw outputs, and figure-generation data are not bundled. Reproducing the 13-setting tables and figures requires those materials. The example data supplies no evidence for the paper's reported numerical results.
 
 ## Source layout
 
@@ -356,7 +354,3 @@ cascade/
 ```
 
 Generated data and results belong under `code/data/` and `code/runs/`. Rebuild downstream artifacts when changing a population, model, score rule, grid or price assumption. Keep frozen files unchanged during each calibration run.
-
-For older runs, refit policies to populate the stored population IDs and calibration predictions, and use the updated `merge --policy ... --oracle-labels ...` arguments. `split.py` now writes only the sample and its metadata, so use the original evidence file as the population. If reranking used an older Sentence Transformers version without Qwen3 support, rebuild evidence and its downstream artifacts.
-
-Runs using `sigmoid(margin / T)` need their SLM base confidences recomputed using `sigmoid(abs(margin) / T)`. Cached paired Y/N log probabilities can supply the new confidences. Rebuild scores, grids, the maximal Stage-2 pool, candidate costs and calibration; obtain Stage-2 outputs for any newly included records. Keep the existing predictions for cached records, since their signed-margin decision rule is unchanged.
