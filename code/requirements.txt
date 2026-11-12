@@ -1,0 +1,7 @@
+numpy
+blingfire
+sentence-transformers>=5.4.0
+transformers>=4.51.0
+torch
+openai
+faiss-cpu

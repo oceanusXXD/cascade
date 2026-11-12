@@ -1,0 +1,3 @@
+{"id":"review-1","query":"Does this review complain about the wait time?","document":"We booked a table for seven. We waited an hour before being seated. The food was good.","label":"yes"}
+{"id":"review-2","query":"Does this review complain about the wait time?","document":"The staff seated us immediately. Dinner was excellent. We will come back.","label":"no"}
+{"id":"review-3","query":"Does this review complain about the wait time?","document":"The room was noisy. The soup was cold. Service was friendly.","label":"no"}
